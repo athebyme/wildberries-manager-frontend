@@ -997,7 +997,7 @@ const MarketplaceManagementSystem = () => {
                                                 {productDetails.photos.slice(0, 4).map((photo, index) => (
                                                     <div key={index} className="aspect-square bg-gray-100 rounded-lg overflow-hidden">
                                                         <img
-                                                            src={`https://images.wbstatic.net/big/${photo.big || photo}`}
+                                                            src={`${photo.big || photo}`}
                                                             alt={`Фото ${index + 1}`}
                                                             className="w-full h-full object-cover"
                                                             onError={(e) => {
