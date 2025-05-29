@@ -11,7 +11,7 @@ import {
     Calendar, RefreshCw, Upload, ChevronDown, User,
     Lock, CreditCard, Shield, Key, Save, Loader,
     Check, X, AlertTriangle, Mail, Phone, Building,
-    ChevronLeft, Star, Tag, Info, ExternalLink
+    ChevronLeft, Star, Tag, Info, ExternalLink, Edit3
 } from 'lucide-react';
 
 const MarketplaceManagementSystem = () => {
@@ -39,6 +39,10 @@ const MarketplaceManagementSystem = () => {
     const [productDetails, setProductDetails] = useState(null);
     const [loadingProductDetails, setLoadingProductDetails] = useState(false);
     const [showProductModal, setShowProductModal] = useState(false);
+    const [isEditMode, setIsEditMode] = useState(false);
+    const [editedProduct, setEditedProduct] = useState(null);
+    const [categoryCharacteristics, setCategoryCharacteristics] = useState([]);
+    const [savingProduct, setSavingProduct] = useState(false);
 
     const logApiError = (error, marketplace) => {
         const errorEntry = {
@@ -57,10 +61,10 @@ const MarketplaceManagementSystem = () => {
     };
 
     const [userProfile, setUserProfile] = useState({
-        name: 'admin',
+        name: 'Иван Петров',
         email: 'admin@marketplace.ru',
         phone: '+7 (999) 123-45-67',
-        company: 'ООО "ТЕСТ"',
+        company: 'ООО "Торговый Дом"',
         inn: '1234567890',
         tariff: 'professional',
         apiUsage: { current: 45000, limit: 100000 },
@@ -119,67 +123,154 @@ const MarketplaceManagementSystem = () => {
     // Задержка между запросами для соблюдения лимитов API
     const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-    // Получение цен товаров WB
+    // Получение цен товаров WB через новый API
     const fetchWBPrices = async (nmIds) => {
         try {
             if (!nmIds || nmIds.length === 0) return {};
 
-            console.log(`Получаем цены для ${nmIds.length} товаров`);
+            console.log(`Получаем цены для ${nmIds.length} товаров:`, nmIds);
 
-            // Используем API v2 для получения цен по номенклатурам
-            // Разбиваем на батчи по 30 номенклатур (лимит API)
             const pricesMap = {};
-            const batchSize = 30;
 
-            for (let i = 0; i < nmIds.length; i += batchSize) {
-                const batch = nmIds.slice(i, i + batchSize);
-                const nmString = batch.join(';');
-
-                try {
-                    // Используем новый API для получения цен
-                    const response = await makeWBRequest(`${WB_API_BASE.prices}/api/v2/list/goods/size/nm?nm=${nmString}`);
-
-                    if (response && response.data) {
-                        response.data.forEach(item => {
-                            if (item.nmID && item.sizes && item.sizes.length > 0) {
-                                const size = item.sizes[0];
-                                pricesMap[item.nmID] = {
-                                    price: size.price || 0,
-                                    discountedPrice: size.discountedPrice || size.price || 0,
-                                    discount: size.discount || 0
-                                };
+            // Пробуем получить цены через карточки товаров (самый надежный способ)
+            try {
+                const cardsResponse = await makeWBRequest(`${WB_API_BASE.content}/content/v2/get/cards/list`, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                        settings: {
+                            cursor: { limit: nmIds.length },
+                            filter: {
+                                nmID: nmIds,
+                                withPhoto: -1
                             }
+                        }
+                    })
+                });
+
+                if (cardsResponse?.cards) {
+                    cardsResponse.cards.forEach(card => {
+                        if (card.nmID && card.sizes && card.sizes.length > 0) {
+                            const price = card.sizes[0].price || 0;
+                            pricesMap[card.nmID] = {
+                                price: price,
+                                discountedPrice: price, // Будет обновлено если есть скидка
+                                discount: 0
+                            };
+                        }
+                    });
+                }
+
+                console.log(`Получены цены из карточек для ${Object.keys(pricesMap).length} товаров`);
+            } catch (cardsError) {
+                console.warn('Не удалось получить цены через карточки:', cardsError);
+            }
+
+            // Если не все цены получены, пробуем альтернативные методы
+            const missingNmIds = nmIds.filter(id => !pricesMap[id]);
+
+            if (missingNmIds.length > 0 && WB_API_BASE.prices) {
+                console.log(`Пробуем получить цены для ${missingNmIds.length} товаров через API цен`);
+
+                // Разбиваем на батчи по 100 товаров
+                const batchSize = 100;
+                for (let i = 0; i < missingNmIds.length; i += batchSize) {
+                    const batch = missingNmIds.slice(i, i + batchSize);
+
+                    try {
+                        // Пробуем разные варианты API
+                        const priceResponse = await makeWBRequest(`${WB_API_BASE.prices}/api/v2/list/goods/filter`, {
+                            method: 'POST',
+                            body: JSON.stringify({
+                                filter: {
+                                    nmID: batch
+                                }
+                            })
                         });
+
+                        if (priceResponse?.data?.listGoods) {
+                            priceResponse.data.listGoods.forEach(item => {
+                                if (item.nmID && !pricesMap[item.nmID]) {
+                                    let price = 0;
+                                    let discountedPrice = 0;
+
+                                    if (item.sizes && item.sizes.length > 0) {
+                                        const firstSize = item.sizes[0];
+                                        price = firstSize.price || 0;
+                                        discountedPrice = firstSize.discountedPrice || firstSize.price || 0;
+                                    }
+
+                                    pricesMap[item.nmID] = {
+                                        price: price,
+                                        discountedPrice: discountedPrice,
+                                        discount: item.discount || 0
+                                    };
+                                }
+                            });
+                        }
+                    } catch (priceError) {
+                        console.warn(`Ошибка получения цен для батча ${i}-${i + batch.length}:`, priceError);
                     }
 
                     // Задержка между батчами
-                    if (i + batchSize < nmIds.length) {
+                    if (i + batchSize < missingNmIds.length) {
                         await delay(200);
                     }
-                } catch (batchError) {
-                    console.warn(`Ошибка получения цен для батча ${i}-${i + batchSize}:`, batchError);
-                    // Продолжаем обработку других батчей
                 }
             }
 
-            console.log(`Получены цены для ${Object.keys(pricesMap).length} товаров из ${nmIds.length}`);
+            console.log(`Итого получены цены для ${Object.keys(pricesMap).length} товаров из ${nmIds.length}`);
             return pricesMap;
 
         } catch (error) {
-            console.warn('Ошибка получения цен:', error);
-            // Возвращаем пустой объект, чтобы не прерывать загрузку товаров
+            console.warn('Общая ошибка получения цен:', error);
             return {};
         }
     };
 
-    // Получение характеристик категории
-    const fetchCategoryCharacteristics = async (categoryName) => {
+    // Получение характеристик категории по ID предмета
+    const fetchCategoryCharacteristicsBySubjectId = async (subjectId) => {
         try {
-            const response = await makeWBRequest(`${WB_API_BASE.content}/content/v2/object/characteristics/${encodeURIComponent(categoryName)}`);
-            return response || [];
+            const response = await makeWBRequest(`${WB_API_BASE.content}/content/v2/object/charcs/${subjectId}`);
+            console.log('Raw характеристики категории:', response);
+
+            // Проверяем формат ответа и извлекаем массив характеристик
+            let characteristics = [];
+
+            if (response) {
+                // Если response это массив
+                if (Array.isArray(response)) {
+                    characteristics = response;
+                }
+                // Если response это объект с полем data
+                else if (response.data && Array.isArray(response.data)) {
+                    characteristics = response.data;
+                }
+                // Если response это объект с полем characteristics
+                else if (response.characteristics && Array.isArray(response.characteristics)) {
+                    characteristics = response.characteristics;
+                }
+                // Если response это объект с другой структурой
+                else if (response.result && Array.isArray(response.result)) {
+                    characteristics = response.result;
+                }
+                // Если response это объект со свойствами характеристик
+                else if (typeof response === 'object' && !Array.isArray(response)) {
+                    // Пробуем извлечь характеристики из объекта
+                    const keys = Object.keys(response);
+                    if (keys.length > 0 && typeof response[keys[0]] === 'object') {
+                        // Возможно, это объект где ключи - это ID характеристик
+                        characteristics = Object.entries(response).map(([key, value]) => ({
+                            id: key,
+                            ...value
+                        }));
+                    }
+                }
+            }
+
+            console.log('Обработанные характеристики категории:', characteristics);
+            return characteristics;
         } catch (error) {
-            console.warn(`Ошибка получения характеристик для категории ${categoryName}:`, error);
-            // Не выбрасываем ошибку, просто возвращаем пустой массив
+            console.warn(`Ошибка получения характеристик для предмета ${subjectId}:`, error);
             return [];
         }
     };
@@ -200,6 +291,11 @@ const MarketplaceManagementSystem = () => {
             });
 
             const cardData = cardResponse?.cards?.[0];
+            if (!cardData) {
+                throw new Error('Карточка товара не найдена');
+            }
+
+            console.log('Данные карточки:', cardData);
 
             // Пытаемся получить цены для конкретного товара
             let priceInfo = {};
@@ -210,42 +306,121 @@ const MarketplaceManagementSystem = () => {
                 console.warn('Не удалось получить цены для товара:', priceError);
             }
 
-            // Извлекаем характеристики из карточки товара
-            const characteristics = [];
-            if (cardData?.characteristics) {
+            // Получаем характеристики категории для полного списка доступных полей
+            let allCharacteristics = [];
+            if (cardData.subjectID) {
+                try {
+                    const charResponse = await fetchCategoryCharacteristicsBySubjectId(cardData.subjectID);
+                    // Убеждаемся, что это массив
+                    allCharacteristics = Array.isArray(charResponse) ? charResponse : [];
+                    setCategoryCharacteristics(allCharacteristics);
+                    console.log('Все характеристики категории:', allCharacteristics);
+                } catch (charError) {
+                    console.warn('Не удалось получить характеристики категории:', charError);
+                    allCharacteristics = [];
+                }
+            }
+
+            // Извлекаем существующие характеристики из карточки
+            const existingCharacteristics = {};
+            if (cardData?.characteristics && Array.isArray(cardData.characteristics)) {
                 cardData.characteristics.forEach(char => {
-                    characteristics.push({
-                        name: char.name || 'Неизвестная характеристика',
-                        value: char.value,
-                        required: false,
-                        unitName: char.unitName || null
-                    });
+                    // Поддерживаем разные форматы ID
+                    const charId = char.id || char.charcID || char.charId || char.name;
+                    if (charId) {
+                        existingCharacteristics[charId] = {
+                            id: charId,
+                            name: char.name || char.charName || 'Неизвестная характеристика',
+                            value: Array.isArray(char.value) ? char.value : [char.value || ''],
+                            unitName: char.unitName || char.unit || null
+                        };
+                    }
                 });
             }
+
+            console.log('Существующие характеристики:', existingCharacteristics);
+
+            // Объединяем с полным списком характеристик категории
+            let allCharacteristicsData = [];
+
+            if (allCharacteristics.length > 0) {
+                // Если есть характеристики категории, используем их
+                allCharacteristicsData = allCharacteristics.map(char => {
+                    const charId = char.id || char.charcID;
+                    const existing = existingCharacteristics[charId];
+                    return {
+                        id: charId,
+                        name: char.name || 'Характеристика',
+                        required: char.required || false,
+                        unitName: char.unitName,
+                        maxCount: char.maxCount || 1,
+                        popular: char.popular || false,
+                        charcType: char.charcType || 1,
+                        value: existing ? existing.value : []
+                    };
+                });
+            } else if (Object.keys(existingCharacteristics).length > 0) {
+                // Если нет характеристик категории, но есть существующие - используем их
+                allCharacteristicsData = Object.values(existingCharacteristics).map(char => ({
+                    id: char.id,
+                    name: char.name,
+                    required: false,
+                    unitName: char.unitName,
+                    value: char.value
+                }));
+            }
+
+            // Добавляем существующие характеристики, которых нет в списке категории
+            Object.entries(existingCharacteristics).forEach(([charId, char]) => {
+                if (!allCharacteristicsData.find(c => c.id === charId)) {
+                    allCharacteristicsData.push({
+                        id: charId,
+                        name: char.name,
+                        required: false,
+                        unitName: char.unitName,
+                        value: char.value
+                    });
+                }
+            });
+
+            console.log('Все характеристики для отображения:', allCharacteristicsData);
 
             // Получаем размеры и их характеристики
             const sizes = cardData?.sizes || [];
             const sizesInfo = sizes.map(size => ({
-                techSize: size.techSize,
-                wbSize: size.wbSize,
+                techSize: size.techSize || '',
+                wbSize: size.wbSize || '',
                 skus: size.skus || [],
-                price: size.price || 0
+                price: size.price || 0,
+                chrtID: size.chrtID
             }));
 
-            return {
+            // Получаем полные данные карточки
+            const detailedProduct = {
                 ...product,
-                characteristics: characteristics,
-                cardData: cardData || {},
-                priceInfo: priceInfo,
-                photos: cardData?.photos || [],
-                video: cardData?.video || '',
-                description: cardData?.description || '',
-                tags: cardData?.tags || [],
-                dimensions: cardData?.dimensions || {},
-                addin: cardData?.addin || [],
+                cardData: cardData,
+                imtID: cardData.imtID,
+                nmID: cardData.nmID,
+                subjectID: cardData.subjectID,
+                subjectName: cardData.subjectName,
+                vendorCode: cardData.vendorCode,
+                brand: cardData.brand || product.brand || 'Не указан',
+                title: cardData.title || product.name,
+                description: cardData.description || '',
+                characteristics: allCharacteristicsData,
                 sizes: sizesInfo,
-                brand: cardData?.brand || product.brand || 'Не указан',
-                category: cardData?.subjectName || product.category || 'Не указана',
+                photos: cardData.photos || [],
+                video: cardData.video || '',
+                tags: cardData.tags || [],
+                dimensions: cardData.dimensions || {
+                    length: '',
+                    width: '',
+                    height: '',
+                    isValid: true
+                },
+                createdAt: cardData.createdAt,
+                updatedAt: cardData.updatedAt,
+                priceInfo: priceInfo,
                 // Обновляем цены если получили новые данные
                 ...(priceInfo.price && {
                     price: priceInfo.price,
@@ -253,6 +428,9 @@ const MarketplaceManagementSystem = () => {
                     discount: priceInfo.discount || 0
                 })
             };
+
+            console.log('Детальная информация о товаре:', detailedProduct);
+            return detailedProduct;
 
         } catch (error) {
             console.error('Ошибка загрузки деталей товара:', error);
@@ -263,11 +441,97 @@ const MarketplaceManagementSystem = () => {
         }
     };
 
+    // Сохранение изменений карточки товара
+    const saveProductChanges = async () => {
+        if (!editedProduct) return;
+
+        // Проверка обязательных полей
+        const requiredCharacteristics = editedProduct.characteristics.filter(char => char.required);
+        const emptyRequired = requiredCharacteristics.filter(char =>
+            !char.value || (Array.isArray(char.value) && char.value.length === 0) ||
+            (Array.isArray(char.value) && char.value[0] === '')
+        );
+
+        if (emptyRequired.length > 0) {
+            alert(`❌ Заполните обязательные поля:\n${emptyRequired.map(char => `• ${char.name}`).join('\n')}`);
+            return;
+        }
+
+        setSavingProduct(true);
+        try {
+            // Подготавливаем данные для обновления в правильном формате
+            const updateData = {
+                cards: [{
+                    imtID: editedProduct.imtID,
+                    nmID: editedProduct.nmID,
+                    vendorCode: editedProduct.vendorCode,
+                    characteristics: editedProduct.characteristics
+                        .filter(char => char.value && (Array.isArray(char.value) ? char.value.length > 0 && char.value[0] !== '' : true))
+                        .map(char => ({
+                            id: parseInt(char.id) || 0,
+                            value: Array.isArray(char.value) ? char.value : [char.value]
+                        })),
+                    sizes: editedProduct.sizes.map(size => ({
+                        techSize: size.techSize,
+                        wbSize: size.wbSize || size.techSize,
+                        price: parseInt(size.price) || 0,
+                        skus: size.skus || []
+                    })),
+                    mediaFiles: editedProduct.photos ? editedProduct.photos.map(photo =>
+                        typeof photo === 'string' ? photo : (photo.big || photo.small || photo)
+                    ) : [],
+                    video: editedProduct.video || '',
+                    tags: editedProduct.tags || [],
+                    description: editedProduct.description || '',
+                    dimensions: {
+                        length: parseInt(editedProduct.dimensions?.length) || 0,
+                        width: parseInt(editedProduct.dimensions?.width) || 0,
+                        height: parseInt(editedProduct.dimensions?.height) || 0,
+                        isValid: true
+                    }
+                }]
+            };
+
+            console.log('Отправляем обновление карточки:', updateData);
+
+            const response = await makeWBRequest(`${WB_API_BASE.content}/content/v2/cards/update`, {
+                method: 'POST',
+                body: JSON.stringify(updateData)
+            });
+
+            console.log('Ответ обновления карточки:', response);
+
+            if (response.error) {
+                throw new Error(response.error || 'Ошибка обновления карточки');
+            }
+
+            if (response.errorText) {
+                throw new Error(response.errorText);
+            }
+
+            alert('✅ Изменения успешно сохранены!');
+
+            // Обновляем данные товара
+            const updatedDetails = await fetchProductDetails(editedProduct);
+            setProductDetails(updatedDetails);
+            setIsEditMode(false);
+            setEditedProduct(null);
+
+        } catch (error) {
+            console.error('Ошибка сохранения изменений:', error);
+            alert(`❌ Ошибка сохранения изменений:\n${error.message}\n\nПроверьте правильность заполнения всех обязательных полей.`);
+        } finally {
+            setSavingProduct(false);
+        }
+    };
+
     // Открыть карточку товара
     const openProductCard = async (product) => {
         setSelectedProduct(product);
         setShowProductModal(true);
         setProductDetails(null);
+        setIsEditMode(false);
+        setEditedProduct(null);
 
         try {
             const details = await fetchProductDetails(product);
@@ -282,6 +546,61 @@ const MarketplaceManagementSystem = () => {
         setShowProductModal(false);
         setSelectedProduct(null);
         setProductDetails(null);
+        setIsEditMode(false);
+        setEditedProduct(null);
+        setCategoryCharacteristics([]);
+    };
+
+    // Начать редактирование товара
+    const startEditProduct = () => {
+        if (productDetails) {
+            // Создаем глубокую копию и преобразуем характеристики в правильный формат
+            const editableProduct = JSON.parse(JSON.stringify(productDetails));
+
+            // Убеждаемся, что все характеристики имеют значения в виде массивов
+            if (editableProduct.characteristics) {
+                editableProduct.characteristics = editableProduct.characteristics.map(char => ({
+                    ...char,
+                    value: Array.isArray(char.value) ? char.value : (char.value ? [char.value] : [])
+                }));
+            }
+
+            setEditedProduct(editableProduct);
+            setIsEditMode(true);
+        }
+    };
+
+    // Отменить редактирование
+    const cancelEditProduct = () => {
+        setIsEditMode(false);
+        setEditedProduct(null);
+    };
+
+    // Обновить характеристику в режиме редактирования
+    const updateCharacteristic = (charId, value) => {
+        if (!editedProduct) return;
+
+        setEditedProduct(prev => ({
+            ...prev,
+            characteristics: prev.characteristics.map(char =>
+                char.id === charId ? {
+                    ...char,
+                    value: value ? [value] : [] // Всегда сохраняем как массив
+                } : char
+            )
+        }));
+    };
+
+    // Обновить размер в режиме редактирования
+    const updateSize = (index, field, value) => {
+        if (!editedProduct) return;
+
+        setEditedProduct(prev => ({
+            ...prev,
+            sizes: prev.sizes.map((size, i) =>
+                i === index ? { ...size, [field]: value } : size
+            )
+        }));
     };
 
     const fetchWBProductsWithPagination = async (cursor = null, searchText = '', isLoadMore = false) => {
@@ -402,7 +721,7 @@ const MarketplaceManagementSystem = () => {
                 }
             }
 
-            // Получаем цены одним запросом (если доступно)
+            // Получаем цены одним запросом
             await delay(200);
             let pricesMap = {};
             try {
@@ -592,7 +911,7 @@ const MarketplaceManagementSystem = () => {
     const updateWBPrices = async (priceUpdates) => {
         try {
             // API для обновления цен
-            const response = await makeWBRequest(`${WB_API_BASE.marketplace}/api/v1/prices`, {
+            const response = await makeWBRequest(`${WB_API_BASE.prices}/api/v2/prices`, {
                 method: 'POST',
                 body: JSON.stringify(priceUpdates)
             });
@@ -939,11 +1258,13 @@ const MarketplaceManagementSystem = () => {
     const renderProductModal = () => {
         if (!showProductModal || !selectedProduct) return null;
 
+        const displayProduct = isEditMode ? editedProduct : productDetails;
+
         return (
             <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-                <div className="bg-white rounded-xl max-w-4xl w-full max-h-[90vh] overflow-y-auto">
+                <div className="bg-white rounded-xl max-w-5xl w-full max-h-[90vh] overflow-y-auto">
                     {/* Заголовок модального окна */}
-                    <div className="sticky top-0 bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between">
+                    <div className="sticky top-0 bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between z-10">
                         <div className="flex items-center gap-3">
                             <button
                                 onClick={closeProductCard}
@@ -953,14 +1274,23 @@ const MarketplaceManagementSystem = () => {
                             </button>
                             <div>
                                 <h2 className="text-xl font-bold text-gray-800 truncate max-w-md">
-                                    {selectedProduct.name}
+                                    {displayProduct?.title || selectedProduct.name}
                                 </h2>
                                 <p className="text-sm text-gray-500">
-                                    Артикул: {selectedProduct.sku} • WB: {selectedProduct.nmID}
+                                    Артикул: {displayProduct?.vendorCode || selectedProduct.sku} • WB: {selectedProduct.nmID}
                                 </p>
                             </div>
                         </div>
                         <div className="flex items-center gap-2">
+                            {!isEditMode && productDetails && (
+                                <button
+                                    onClick={startEditProduct}
+                                    className="p-2 text-blue-600 hover:bg-blue-50 rounded-lg"
+                                    title="Редактировать товар"
+                                >
+                                    <Edit3 size={18} />
+                                </button>
+                            )}
                             <a
                                 href={`https://www.wildberries.ru/catalog/${selectedProduct.nmID}/detail.aspx`}
                                 target="_blank"
@@ -986,30 +1316,75 @@ const MarketplaceManagementSystem = () => {
                                 <Loader className="animate-spin text-blue-600" size={32} />
                                 <span className="ml-3 text-gray-600">Загружаем детали товара...</span>
                             </div>
-                        ) : productDetails ? (
+                        ) : displayProduct ? (
                             <div className="space-y-6">
+                                {/* Кнопки действий в режиме редактирования */}
+                                {isEditMode && (
+                                    <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+                                        <div className="flex items-center justify-between">
+                                            <div className="flex items-center gap-2">
+                                                <Edit3 className="text-yellow-600" size={20} />
+                                                <span className="text-yellow-800 font-medium">Режим редактирования</span>
+                                            </div>
+                                            <div className="flex gap-2">
+                                                <button
+                                                    onClick={cancelEditProduct}
+                                                    className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300"
+                                                >
+                                                    Отмена
+                                                </button>
+                                                <button
+                                                    onClick={saveProductChanges}
+                                                    disabled={savingProduct}
+                                                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2"
+                                                >
+                                                    {savingProduct ? (
+                                                        <>
+                                                            <Loader className="animate-spin" size={16} />
+                                                            Сохранение...
+                                                        </>
+                                                    ) : (
+                                                        <>
+                                                            <Save size={16} />
+                                                            Сохранить изменения
+                                                        </>
+                                                    )}
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
                                 {/* Основная информация */}
                                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                                     {/* Левая колонка - изображения */}
                                     <div className="space-y-4">
-                                        {productDetails.photos && productDetails.photos.length > 0 ? (
+                                        {displayProduct.photos && displayProduct.photos.length > 0 ? (
                                             <div className="grid grid-cols-2 gap-2">
-                                                {productDetails.photos.slice(0, 4).map((photo, index) => (
-                                                    <div key={index} className="aspect-square bg-gray-100 rounded-lg overflow-hidden">
-                                                        <img
-                                                            src={`${photo.big || photo}`}
-                                                            alt={`Фото ${index + 1}`}
-                                                            className="w-full h-full object-cover"
-                                                            onError={(e) => {
-                                                                e.target.style.display = 'none';
-                                                                e.target.nextSibling.style.display = 'flex';
-                                                            }}
-                                                        />
-                                                        <div className="w-full h-full bg-gray-200 flex items-center justify-center" style={{display: 'none'}}>
-                                                            <Package className="text-gray-400" size={32} />
+                                                {displayProduct.photos.slice(0, 4).map((photo, index) => {
+                                                    const photoUrl = typeof photo === 'string'
+                                                        ? photo
+                                                        : (photo.big ? `https://images.wbstatic.net/big/${photo.big}` :
+                                                            photo.small ? `https://images.wbstatic.net/tm/${photo.small}` :
+                                                                photo);
+
+                                                    return (
+                                                        <div key={index} className="aspect-square bg-gray-100 rounded-lg overflow-hidden">
+                                                            <img
+                                                                src={photoUrl}
+                                                                alt={`Фото ${index + 1}`}
+                                                                className="w-full h-full object-cover"
+                                                                onError={(e) => {
+                                                                    e.target.style.display = 'none';
+                                                                    e.target.nextSibling.style.display = 'flex';
+                                                                }}
+                                                            />
+                                                            <div className="w-full h-full bg-gray-200 flex items-center justify-center" style={{display: 'none'}}>
+                                                                <Package className="text-gray-400" size={32} />
+                                                            </div>
                                                         </div>
-                                                    </div>
-                                                ))}
+                                                    );
+                                                })}
                                             </div>
                                         ) : (
                                             <div className="aspect-square bg-gray-100 rounded-lg flex items-center justify-center">
@@ -1025,24 +1400,24 @@ const MarketplaceManagementSystem = () => {
                                         <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
                                             <div className="flex items-center justify-between mb-2">
                                                 <span className="text-sm font-medium text-blue-700">Цена</span>
-                                                {productDetails.discount > 0 && (
+                                                {(displayProduct.discount > 0 || displayProduct.priceInfo?.discount > 0) && (
                                                     <span className="px-2 py-1 bg-red-100 text-red-800 text-xs font-medium rounded-full">
-                                                        -{productDetails.discount}%
+                                                        -{displayProduct.discount || displayProduct.priceInfo?.discount}%
                                                     </span>
                                                 )}
                                             </div>
-                                            {productDetails.discountedPrice && productDetails.discountedPrice !== productDetails.price ? (
+                                            {displayProduct.discountedPrice && displayProduct.discountedPrice !== displayProduct.price ? (
                                                 <div className="flex items-center gap-3">
                                                     <span className="text-2xl font-bold text-green-600">
-                                                        ₽{productDetails.discountedPrice.toLocaleString()}
+                                                        ₽{displayProduct.discountedPrice.toLocaleString()}
                                                     </span>
                                                     <span className="text-lg text-gray-500 line-through">
-                                                        ₽{productDetails.price.toLocaleString()}
+                                                        ₽{displayProduct.price.toLocaleString()}
                                                     </span>
                                                 </div>
                                             ) : (
                                                 <span className="text-2xl font-bold text-blue-800">
-                                                    ₽{productDetails.price.toLocaleString()}
+                                                    ₽{displayProduct.price?.toLocaleString() || '0'}
                                                 </span>
                                             )}
                                         </div>
@@ -1052,11 +1427,11 @@ const MarketplaceManagementSystem = () => {
                                             <span className="text-sm font-medium text-gray-700 block mb-2">Остаток на складе</span>
                                             <div className="flex items-center gap-2">
                                                 <span className={`text-2xl font-bold ${
-                                                    productDetails.stock > 10 ? 'text-green-600' :
-                                                        productDetails.stock > 0 ? 'text-yellow-600' :
+                                                    displayProduct.stock > 10 ? 'text-green-600' :
+                                                        displayProduct.stock > 0 ? 'text-yellow-600' :
                                                             'text-red-600'
                                                 }`}>
-                                                    {productDetails.stock}
+                                                    {displayProduct.stock || 0}
                                                 </span>
                                                 <span className="text-gray-500">шт.</span>
                                             </div>
@@ -1066,43 +1441,43 @@ const MarketplaceManagementSystem = () => {
                                         <div className="space-y-3">
                                             <div className="flex items-center justify-between py-2 border-b border-gray-100">
                                                 <span className="text-sm text-gray-600">Бренд</span>
-                                                <span className="font-medium">{productDetails.brand}</span>
+                                                <span className="font-medium">{displayProduct.brand}</span>
                                             </div>
                                             <div className="flex items-center justify-between py-2 border-b border-gray-100">
                                                 <span className="text-sm text-gray-600">Категория</span>
-                                                <span className="font-medium">{productDetails.category}</span>
+                                                <span className="font-medium">{displayProduct.subjectName || displayProduct.category}</span>
                                             </div>
                                             <div className="flex items-center justify-between py-2 border-b border-gray-100">
                                                 <span className="text-sm text-gray-600">Штрихкод</span>
-                                                <span className="font-mono text-sm">{productDetails.barcode}</span>
+                                                <span className="font-mono text-sm">{displayProduct.barcode || selectedProduct.barcode}</span>
                                             </div>
                                             <div className="flex items-center justify-between py-2 border-b border-gray-100">
                                                 <span className="text-sm text-gray-600">Артикул продавца</span>
-                                                <span className="font-mono text-sm">{productDetails.cardData?.vendorCode || productDetails.sku}</span>
+                                                <span className="font-mono text-sm">{displayProduct.vendorCode}</span>
                                             </div>
                                             <div className="flex items-center justify-between py-2 border-b border-gray-100">
                                                 <span className="text-sm text-gray-600">ID товара (nmID)</span>
-                                                <span className="font-mono text-sm">{productDetails.nmID}</span>
+                                                <span className="font-mono text-sm">{displayProduct.nmID}</span>
                                             </div>
-                                            {productDetails.cardData?.imtID && (
+                                            {displayProduct.imtID && (
                                                 <div className="flex items-center justify-between py-2 border-b border-gray-100">
                                                     <span className="text-sm text-gray-600">ID карточки (imtID)</span>
-                                                    <span className="font-mono text-sm">{productDetails.cardData.imtID}</span>
+                                                    <span className="font-mono text-sm">{displayProduct.imtID}</span>
                                                 </div>
                                             )}
-                                            {productDetails.cardData?.createdAt && (
+                                            {displayProduct.createdAt && (
                                                 <div className="flex items-center justify-between py-2 border-b border-gray-100">
                                                     <span className="text-sm text-gray-600">Создан</span>
                                                     <span className="text-sm">
-                                                        {new Date(productDetails.cardData.createdAt).toLocaleDateString('ru-RU')}
+                                                        {new Date(displayProduct.createdAt).toLocaleDateString('ru-RU')}
                                                     </span>
                                                 </div>
                                             )}
-                                            {productDetails.cardData?.updatedAt && (
+                                            {displayProduct.updatedAt && (
                                                 <div className="flex items-center justify-between py-2 border-b border-gray-100">
                                                     <span className="text-sm text-gray-600">Обновлен</span>
                                                     <span className="text-sm">
-                                                        {new Date(productDetails.cardData.updatedAt).toLocaleDateString('ru-RU')}
+                                                        {new Date(displayProduct.updatedAt).toLocaleDateString('ru-RU')}
                                                     </span>
                                                 </div>
                                             )}
@@ -1111,30 +1486,87 @@ const MarketplaceManagementSystem = () => {
                                 </div>
 
                                 {/* Описание */}
-                                {productDetails.description && (
-                                    <div className="bg-gray-50 border border-gray-200 rounded-lg p-4">
-                                        <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2">
-                                            <FileText size={18} />
-                                            Описание
-                                        </h3>
-                                        <p className="text-gray-700 whitespace-pre-wrap">{productDetails.description}</p>
-                                    </div>
-                                )}
+                                <div className="bg-gray-50 border border-gray-200 rounded-lg p-4">
+                                    <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2">
+                                        <FileText size={18} />
+                                        Описание
+                                    </h3>
+                                    {isEditMode ? (
+                                        <textarea
+                                            value={editedProduct.description || ''}
+                                            onChange={(e) => setEditedProduct({...editedProduct, description: e.target.value})}
+                                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 min-h-[100px]"
+                                            placeholder="Введите описание товара..."
+                                        />
+                                    ) : (
+                                        <p className="text-gray-700 whitespace-pre-wrap">
+                                            {displayProduct.description || 'Описание не указано'}
+                                        </p>
+                                    )}
+                                </div>
 
                                 {/* Характеристики товара */}
-                                {productDetails.characteristics && productDetails.characteristics.length > 0 && (
+                                {displayProduct.characteristics && displayProduct.characteristics.length > 0 && (
                                     <div className="bg-white border border-gray-200 rounded-lg p-4">
-                                        <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
-                                            <Info size={18} />
-                                            Характеристики товара
+                                        <h3 className="font-semibold text-gray-800 mb-4 flex items-center justify-between">
+                                            <span className="flex items-center gap-2">
+                                                <Info size={18} />
+                                                Характеристики товара
+                                                {isEditMode && (
+                                                    <span className="text-sm font-normal text-gray-500 ml-2">
+                                                        (заполните необходимые поля)
+                                                    </span>
+                                                )}
+                                            </span>
+                                            {isEditMode && categoryCharacteristics.length > displayProduct.characteristics.length && (
+                                                <button
+                                                    onClick={() => {
+                                                        // Добавляем недостающие характеристики из категории
+                                                        const currentIds = new Set(editedProduct.characteristics.map(c => c.id));
+                                                        const newChars = categoryCharacteristics
+                                                            .filter(cat => !currentIds.has(cat.id))
+                                                            .map(cat => ({
+                                                                id: cat.id,
+                                                                name: cat.name,
+                                                                required: cat.required || false,
+                                                                unitName: cat.unitName,
+                                                                value: []
+                                                            }));
+
+                                                        setEditedProduct({
+                                                            ...editedProduct,
+                                                            characteristics: [...editedProduct.characteristics, ...newChars]
+                                                        });
+                                                    }}
+                                                    className="text-sm text-blue-600 hover:text-blue-800"
+                                                >
+                                                    + Добавить все характеристики категории
+                                                </button>
+                                            )}
                                         </h3>
                                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                                            {productDetails.characteristics.map((char, index) => (
-                                                <div key={index} className="border border-gray-100 rounded-lg p-3">
-                                                    <div className="font-medium text-gray-800 mb-1">{char.name}</div>
-                                                    <div className="text-sm text-gray-600">
-                                                        {char.value || 'Не указано'}
+                                            {displayProduct.characteristics.map((char, index) => (
+                                                <div key={char.id || index} className="border border-gray-100 rounded-lg p-3">
+                                                    <div className="font-medium text-gray-800 mb-1 flex items-center gap-1">
+                                                        {char.name}
+                                                        {char.required && <span className="text-red-500">*</span>}
                                                     </div>
+                                                    {isEditMode ? (
+                                                        <input
+                                                            type="text"
+                                                            value={Array.isArray(char.value) ? char.value[0] || '' : char.value || ''}
+                                                            onChange={(e) => updateCharacteristic(char.id, e.target.value)}
+                                                            className="w-full px-2 py-1 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                            placeholder={char.required ? 'Обязательное поле' : 'Необязательное поле'}
+                                                        />
+                                                    ) : (
+                                                        <div className="text-sm text-gray-600">
+                                                            {Array.isArray(char.value)
+                                                                ? (char.value.length > 0 ? char.value.join(', ') : 'Не указано')
+                                                                : (char.value || 'Не указано')
+                                                            }
+                                                        </div>
+                                                    )}
                                                     {char.unitName && (
                                                         <div className="text-xs text-gray-500 mt-1">
                                                             Единица: {char.unitName}
@@ -1147,34 +1579,42 @@ const MarketplaceManagementSystem = () => {
                                 )}
 
                                 {/* Размеры товара */}
-                                {productDetails.sizes && productDetails.sizes.length > 0 && (
+                                {displayProduct.sizes && displayProduct.sizes.length > 0 && (
                                     <div className="bg-white border border-gray-200 rounded-lg p-4">
                                         <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
                                             <Tag size={18} />
                                             Размеры и SKU
                                         </h3>
                                         <div className="space-y-3">
-                                            {productDetails.sizes.map((size, index) => (
+                                            {displayProduct.sizes.map((size, index) => (
                                                 <div key={index} className="border border-gray-100 rounded-lg p-3">
                                                     <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
-                                                        {size.techSize && (
+                                                        {(size.techSize || isEditMode) && (
                                                             <div>
                                                                 <span className="text-gray-600">Тех. размер:</span>
-                                                                <div className="font-medium">{size.techSize}</div>
+                                                                <div className="font-medium">{size.techSize || 'Не указан'}</div>
                                                             </div>
                                                         )}
-                                                        {size.wbSize && (
+                                                        {(size.wbSize || isEditMode) && (
                                                             <div>
                                                                 <span className="text-gray-600">Размер WB:</span>
-                                                                <div className="font-medium">{size.wbSize}</div>
+                                                                <div className="font-medium">{size.wbSize || 'Не указан'}</div>
                                                             </div>
                                                         )}
-                                                        {size.price > 0 && (
-                                                            <div>
-                                                                <span className="text-gray-600">Цена:</span>
-                                                                <div className="font-medium">₽{size.price.toLocaleString()}</div>
-                                                            </div>
-                                                        )}
+                                                        <div>
+                                                            <span className="text-gray-600">Цена:</span>
+                                                            {isEditMode ? (
+                                                                <input
+                                                                    type="number"
+                                                                    value={size.price || 0}
+                                                                    onChange={(e) => updateSize(index, 'price', parseInt(e.target.value) || 0)}
+                                                                    className="w-full px-2 py-1 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                                    min="0"
+                                                                />
+                                                            ) : (
+                                                                <div className="font-medium">₽{(size.price || 0).toLocaleString()}</div>
+                                                            )}
+                                                        </div>
                                                         {size.skus && size.skus.length > 0 && (
                                                             <div>
                                                                 <span className="text-gray-600">SKU:</span>
@@ -1188,36 +1628,113 @@ const MarketplaceManagementSystem = () => {
                                     </div>
                                 )}
 
+                                {/* Габариты */}
+                                {displayProduct.dimensions && (
+                                    <div className="bg-white border border-gray-200 rounded-lg p-4">
+                                        <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
+                                            <Box size={18} />
+                                            Габариты товара
+                                        </h3>
+                                        <div className="grid grid-cols-3 gap-4">
+                                            <div>
+                                                <label className="text-sm text-gray-600 block mb-1">Длина (см)</label>
+                                                {isEditMode ? (
+                                                    <input
+                                                        type="number"
+                                                        value={editedProduct.dimensions.length || ''}
+                                                        onChange={(e) => setEditedProduct({
+                                                            ...editedProduct,
+                                                            dimensions: {...editedProduct.dimensions, length: e.target.value}
+                                                        })}
+                                                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                        placeholder="0"
+                                                    />
+                                                ) : (
+                                                    <div className="font-medium">{displayProduct.dimensions.length || 'Не указано'}</div>
+                                                )}
+                                            </div>
+                                            <div>
+                                                <label className="text-sm text-gray-600 block mb-1">Ширина (см)</label>
+                                                {isEditMode ? (
+                                                    <input
+                                                        type="number"
+                                                        value={editedProduct.dimensions.width || ''}
+                                                        onChange={(e) => setEditedProduct({
+                                                            ...editedProduct,
+                                                            dimensions: {...editedProduct.dimensions, width: e.target.value}
+                                                        })}
+                                                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                        placeholder="0"
+                                                    />
+                                                ) : (
+                                                    <div className="font-medium">{displayProduct.dimensions.width || 'Не указано'}</div>
+                                                )}
+                                            </div>
+                                            <div>
+                                                <label className="text-sm text-gray-600 block mb-1">Высота (см)</label>
+                                                {isEditMode ? (
+                                                    <input
+                                                        type="number"
+                                                        value={editedProduct.dimensions.height || ''}
+                                                        onChange={(e) => setEditedProduct({
+                                                            ...editedProduct,
+                                                            dimensions: {...editedProduct.dimensions, height: e.target.value}
+                                                        })}
+                                                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                        placeholder="0"
+                                                    />
+                                                ) : (
+                                                    <div className="font-medium">{displayProduct.dimensions.height || 'Не указано'}</div>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Видео */}
+                                {(displayProduct.video || isEditMode) && (
+                                    <div className="bg-gray-50 border border-gray-200 rounded-lg p-4">
+                                        <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2">
+                                            <FileText size={18} />
+                                            Видео товара
+                                        </h3>
+                                        {isEditMode ? (
+                                            <input
+                                                type="text"
+                                                value={editedProduct.video || ''}
+                                                onChange={(e) => setEditedProduct({...editedProduct, video: e.target.value})}
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                placeholder="Ссылка на видео..."
+                                            />
+                                        ) : (
+                                            <p className="text-gray-700">
+                                                {displayProduct.video ? (
+                                                    <a href={displayProduct.video} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">
+                                                        Смотреть видео
+                                                    </a>
+                                                ) : (
+                                                    'Видео не добавлено'
+                                                )}
+                                            </p>
+                                        )}
+                                    </div>
+                                )}
+
                                 {/* Теги */}
-                                {productDetails.tags && productDetails.tags.length > 0 && (
+                                {displayProduct.tags && displayProduct.tags.length > 0 && (
                                     <div className="bg-white border border-gray-200 rounded-lg p-4">
                                         <h3 className="font-semibold text-gray-800 mb-3 flex items-center gap-2">
                                             <Tag size={18} />
                                             Теги
                                         </h3>
                                         <div className="flex flex-wrap gap-2">
-                                            {productDetails.tags.map((tag, index) => (
+                                            {displayProduct.tags.map((tag, index) => (
                                                 <span
                                                     key={index}
                                                     className="px-3 py-1 bg-blue-100 text-blue-800 text-sm rounded-full"
                                                 >
-                                                    {tag.name}
+                                                    {tag.name || tag}
                                                 </span>
-                                            ))}
-                                        </div>
-                                    </div>
-                                )}
-
-                                {/* Дополнительные поля */}
-                                {productDetails.addin && productDetails.addin.length > 0 && (
-                                    <div className="bg-white border border-gray-200 rounded-lg p-4">
-                                        <h3 className="font-semibold text-gray-800 mb-3">Дополнительные поля</h3>
-                                        <div className="space-y-2">
-                                            {productDetails.addin.map((field, index) => (
-                                                <div key={index} className="flex items-center justify-between py-2 border-b border-gray-100 last:border-b-0">
-                                                    <span className="text-sm text-gray-600">{field.type}</span>
-                                                    <span className="font-medium">{field.params?.value || 'Не указано'}</span>
-                                                </div>
                                             ))}
                                         </div>
                                     </div>
@@ -1743,7 +2260,14 @@ const MarketplaceManagementSystem = () => {
                                             >
                                                 <Eye size={16} />
                                             </button>
-                                            <button className="text-gray-600 hover:text-gray-800 p-1 rounded hover:bg-gray-50" title="Редактировать">
+                                            <button
+                                                className="text-gray-600 hover:text-gray-800 p-1 rounded hover:bg-gray-50"
+                                                title="Редактировать"
+                                                onClick={async () => {
+                                                    await openProductCard(product);
+                                                    setTimeout(() => startEditProduct(), 500);
+                                                }}
+                                            >
                                                 <Edit size={16} />
                                             </button>
                                             <button className="text-red-600 hover:text-red-800 p-1 rounded hover:bg-red-50" title="Удалить">
@@ -1990,13 +2514,18 @@ const MarketplaceManagementSystem = () => {
                             <input
                                 type="password"
                                 value={apiKeys.wildberries}
-                                onChange={(e) => setApiKeys({...apiKeys, wildberries: e.target.value})}
+                                onChange={(e) => setApiKeys({...apiKeys, wildberries: e.target.value.trim()})}
                                 placeholder="Введите API ключ (64 символа)"
                                 className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900 placeholder-gray-500"
                             />
                             <p className="text-xs text-gray-500 mt-1">
                                 Получить в ЛК → Настройки → Доступ к API. Выберите категории: Контент, Маркетплейс и Цены.
                             </p>
+                            {apiKeys.wildberries && apiKeys.wildberries.length !== 64 && (
+                                <p className="text-xs text-red-500 mt-1">
+                                    ⚠️ API ключ должен содержать ровно 64 символа (сейчас: {apiKeys.wildberries.length})
+                                </p>
+                            )}
                         </div>
                         <div className="flex flex-wrap gap-3">
                             <button
@@ -2025,6 +2554,8 @@ const MarketplaceManagementSystem = () => {
                                         <li>Получение новых заказов (сборочных заданий)</li>
                                         <li>Синхронизация остатков товаров на складах</li>
                                         <li>Получение и обновление цен товаров (если доступно)</li>
+                                        <li>Редактирование карточек товаров</li>
+                                        <li>Управление характеристиками товаров</li>
                                         <li>Мониторинг скидок и акций</li>
                                         <li>Мониторинг статусов заказов</li>
                                         <li>Тестирование подключения к API</li>
