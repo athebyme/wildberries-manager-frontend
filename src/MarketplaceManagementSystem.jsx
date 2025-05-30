@@ -150,11 +150,19 @@ const MarketplaceManagementSystem = () => {
                 if (cardsResponse?.cards) {
                     cardsResponse.cards.forEach(card => {
                         if (card.nmID && card.sizes && card.sizes.length > 0) {
+                            // Берем первую цену из размеров
                             const price = card.sizes[0].price || 0;
+
+                            // Попробуем найти скидку в данных карточки
+                            let discount = 0;
+                            if (card.sizes[0].discountedPrice && card.sizes[0].price) {
+                                discount = Math.round(((card.sizes[0].price - card.sizes[0].discountedPrice) / card.sizes[0].price) * 100);
+                            }
+
                             pricesMap[card.nmID] = {
                                 price: price,
-                                discountedPrice: price, // Будет обновлено если есть скидка
-                                discount: 0
+                                discountedPrice: card.sizes[0].discountedPrice || price,
+                                discount: discount
                             };
                         }
                     });
@@ -165,65 +173,111 @@ const MarketplaceManagementSystem = () => {
                 console.warn('Не удалось получить цены через карточки:', cardsError);
             }
 
-            // Если не все цены получены, пробуем альтернативные методы
+            // Если не все цены получены, пробуем через API статистики (альтернативный метод)
             const missingNmIds = nmIds.filter(id => !pricesMap[id]);
 
-            if (missingNmIds.length > 0 && WB_API_BASE.prices) {
-                console.log(`Пробуем получить цены для ${missingNmIds.length} товаров через API цен`);
+            if (missingNmIds.length > 0 && WB_API_BASE.statistics) {
+                console.log(`Пробуем получить цены для ${missingNmIds.length} товаров через API статистики`);
 
-                // Разбиваем на батчи по 100 товаров
-                const batchSize = 100;
-                for (let i = 0; i < missingNmIds.length; i += batchSize) {
-                    const batch = missingNmIds.slice(i, i + batchSize);
+                try {
+                    // Получаем данные за последний день
+                    const dateFrom = new Date();
+                    dateFrom.setDate(dateFrom.getDate() - 1);
+                    const dateFromISO = dateFrom.toISOString().split('T')[0];
 
-                    try {
-                        // Пробуем разные варианты API
-                        const priceResponse = await makeWBRequest(`${WB_API_BASE.prices}/api/v2/list/goods/filter`, {
-                            method: 'POST',
-                            body: JSON.stringify({
-                                filter: {
-                                    nmID: batch
+                    console.log('Запрос к API Статистики с dateFrom:', dateFromISO);
+
+                    // URL для запроса статистики. Если используете прокси, измените WB_API_BASE.statistics
+                    const statsUrl = `${WB_API_BASE.statistics}/api/v1/supplier/stocks?dateFrom=${dateFromISO}`;
+                    // Важно! API статистики WB /api/v1/supplier/stocks принимает dateFrom как query параметр, а не заголовок!
+                    // Спецификация для этого API: https://openapi.wildberries.ru/statistics/api/ru/#tag/Statistika/paths/~1api~1v1~1supplier~1stocks/get
+                    // Она показывает `dateFrom` в `query`.
+
+                    const statsResponse = await makeWBRequest(statsUrl, {
+                        method: 'GET',
+                        // headers: { // Убираем dateFrom из заголовков для этого конкретного API
+                        //    'dateFrom': dateFromISO // <- Это было причиной CORS ошибки
+                        // }
+                    });
+
+                    if (statsResponse && Array.isArray(statsResponse)) {
+                        statsResponse.forEach(item => {
+                            // В ответе /api/v1/supplier/stocks обычно есть поля price и discount
+                            if (item.nmId && !pricesMap[item.nmId]) {
+                                // Используем поля из ответа статистики, если они есть
+                                // Примерные поля из API статистики (могут отличаться, проверяйте ответ):
+                                // item.price - цена без скидки
+                                // item.discount - скидка в %
+                                // item.totalPrice - цена со скидкой
+                                // item.finishedPrice - финальная цена (может включать доп. скидки WB)
+
+                                let price = item.price || 0;
+                                let discount = item.discount || 0;
+                                let discountedPrice = item.price * (1 - (item.discount / 100)); // Рассчитываем, если нет totalPrice
+
+                                if (item.totalPrice) { // Если есть totalPrice, используем его
+                                    discountedPrice = item.totalPrice;
+                                } else if (item.finishedPrice) { // Как запасной вариант
+                                    discountedPrice = item.finishedPrice;
                                 }
-                            })
+
+                                // Убедимся, что скидка не отрицательная
+                                if (price > 0 && discountedPrice < price) {
+                                    discount = Math.round(((price - discountedPrice) / price) * 100);
+                                } else {
+                                    discount = 0; // Если цена со скидкой равна или больше
+                                }
+
+
+                                pricesMap[item.nmId] = {
+                                    price: price,
+                                    discountedPrice: discountedPrice,
+                                    discount: discount
+                                };
+                            }
                         });
-
-                        if (priceResponse?.data?.listGoods) {
-                            priceResponse.data.listGoods.forEach(item => {
-                                if (item.nmID && !pricesMap[item.nmID]) {
-                                    let price = 0;
-                                    let discountedPrice = 0;
-
-                                    if (item.sizes && item.sizes.length > 0) {
-                                        const firstSize = item.sizes[0];
-                                        price = firstSize.price || 0;
-                                        discountedPrice = firstSize.discountedPrice || firstSize.price || 0;
-                                    }
-
-                                    pricesMap[item.nmID] = {
-                                        price: price,
-                                        discountedPrice: discountedPrice,
-                                        discount: item.discount || 0
-                                    };
-                                }
-                            });
-                        }
-                    } catch (priceError) {
-                        console.warn(`Ошибка получения цен для батча ${i}-${i + batch.length}:`, priceError);
+                        console.log('Цены из API статистики получены:', pricesMap);
                     }
-
-                    // Задержка между батчами
-                    if (i + batchSize < missingNmIds.length) {
-                        await delay(200);
+                } catch (statsError) {
+                    console.warn('Не удалось получить цены через API статистики:', statsError);
+                    // Если ошибка CORS, то это значит, что сервер все еще блокирует,
+                    // либо что-то не так с прокси (если он настроен).
+                    // Если другая ошибка, логируем ее.
+                    if (statsError.message.includes('CORS')) {
+                        logApiError(new Error('CORS_BLOCK_STATISTICS_API: ' + statsError.message), 'Wildberries');
+                    } else {
+                        logApiError(statsError, 'Wildberries (API Статистики)');
                     }
                 }
             }
 
             console.log(`Итого получены цены для ${Object.keys(pricesMap).length} товаров из ${nmIds.length}`);
+
+            // Для товаров без цен устанавливаем нулевые значения
+            nmIds.forEach(nmId => {
+                if (!pricesMap[nmId]) {
+                    pricesMap[nmId] = {
+                        price: 0,
+                        discountedPrice: 0,
+                        discount: 0
+                    };
+                }
+            });
+
             return pricesMap;
 
         } catch (error) {
             console.warn('Общая ошибка получения цен:', error);
-            return {};
+            // Возвращаем пустые цены для всех товаров
+            const emptyPrices = {};
+            nmIds.forEach(nmId => {
+                emptyPrices[nmId] = {
+                    price: 0,
+                    discountedPrice: 0,
+                    discount: 0
+                };
+            });
+            return emptyPrices;
         }
     };
 
@@ -249,7 +303,7 @@ const MarketplaceManagementSystem = () => {
                 else if (response.characteristics && Array.isArray(response.characteristics)) {
                     characteristics = response.characteristics;
                 }
-                // Если response это объект с другой структурой
+                // Если response это объект с полем result
                 else if (response.result && Array.isArray(response.result)) {
                     characteristics = response.result;
                 }
@@ -366,7 +420,8 @@ const MarketplaceManagementSystem = () => {
                     name: char.name,
                     required: false,
                     unitName: char.unitName,
-                    value: char.value
+                    value: char.value,
+                    popular: false
                 }));
             }
 
@@ -378,7 +433,8 @@ const MarketplaceManagementSystem = () => {
                         name: char.name,
                         required: false,
                         unitName: char.unitName,
-                        value: char.value
+                        value: char.value,
+                        popular: false
                     });
                 }
             });
@@ -394,6 +450,9 @@ const MarketplaceManagementSystem = () => {
                 price: size.price || 0,
                 chrtID: size.chrtID
             }));
+
+            // Получаем основную цену из первого размера
+            const mainPrice = sizes.length > 0 && sizes[0].price ? sizes[0].price : 0;
 
             // Получаем полные данные карточки
             const detailedProduct = {
@@ -421,12 +480,10 @@ const MarketplaceManagementSystem = () => {
                 createdAt: cardData.createdAt,
                 updatedAt: cardData.updatedAt,
                 priceInfo: priceInfo,
-                // Обновляем цены если получили новые данные
-                ...(priceInfo.price && {
-                    price: priceInfo.price,
-                    discountedPrice: priceInfo.discountedPrice,
-                    discount: priceInfo.discount || 0
-                })
+                // Обновляем цены: если есть из API, используем их, иначе из карточки
+                price: priceInfo.price || mainPrice || product.price || 0,
+                discountedPrice: priceInfo.discountedPrice || priceInfo.price || mainPrice || product.price || 0,
+                discount: priceInfo.discount || product.discount || 0
             };
 
             console.log('Детальная информация о товаре:', detailedProduct);
@@ -445,7 +502,7 @@ const MarketplaceManagementSystem = () => {
     const saveProductChanges = async () => {
         if (!editedProduct) return;
 
-        // Проверка обязательных полей
+        // Проверка обязательных полей (если у вас есть эта логика)
         const requiredCharacteristics = editedProduct.characteristics.filter(char => char.required);
         const emptyRequired = requiredCharacteristics.filter(char =>
             !char.value || (Array.isArray(char.value) && char.value.length === 0) ||
@@ -453,73 +510,125 @@ const MarketplaceManagementSystem = () => {
         );
 
         if (emptyRequired.length > 0) {
-            alert(`❌ Заполните обязательные поля:\n${emptyRequired.map(char => `• ${char.name}`).join('\n')}`);
+            alert(`❌ Заполните обязательные характеристики:\n${emptyRequired.map(char => `• ${char.name}`).join('\n')}`);
+            return;
+        }
+        if (!editedProduct.vendorCode) {
+            alert('❌ Артикул продавца (vendorCode) является обязательным полем.');
+            return;
+        }
+        if (!editedProduct.sizes || editedProduct.sizes.length === 0) {
+            alert('❌ Необходимо указать хотя бы один размер (массив sizes).');
             return;
         }
 
+
         setSavingProduct(true);
         try {
-            // Подготавливаем данные для обновления в правильном формате
-            const updateData = {
-                cards: [{
-                    imtID: editedProduct.imtID,
-                    nmID: editedProduct.nmID,
-                    vendorCode: editedProduct.vendorCode,
-                    characteristics: editedProduct.characteristics
-                        .filter(char => char.value && (Array.isArray(char.value) ? char.value.length > 0 && char.value[0] !== '' : true))
-                        .map(char => ({
-                            id: parseInt(char.id) || 0,
-                            value: Array.isArray(char.value) ? char.value : [char.value]
-                        })),
-                    sizes: editedProduct.sizes.map(size => ({
-                        techSize: size.techSize,
-                        wbSize: size.wbSize || size.techSize,
-                        price: parseInt(size.price) || 0,
-                        skus: size.skus || []
-                    })),
-                    mediaFiles: editedProduct.photos ? editedProduct.photos.map(photo =>
-                        typeof photo === 'string' ? photo : (photo.big || photo.small || photo)
-                    ) : [],
-                    video: editedProduct.video || '',
-                    tags: editedProduct.tags || [],
-                    description: editedProduct.description || '',
-                    dimensions: {
-                        length: parseInt(editedProduct.dimensions?.length) || 0,
-                        width: parseInt(editedProduct.dimensions?.width) || 0,
-                        height: parseInt(editedProduct.dimensions?.height) || 0,
-                        isValid: true
-                    }
-                }]
+            // Подготавливаем данные для обновления согласно спецификации /content/v2/cards/update
+            const cardUpdatePayload = {
+                nmID: editedProduct.nmID, // Required
+                vendorCode: editedProduct.vendorCode, // Required
+                // --- Эти поля должны быть переданы, т.к. API перезаписывает карточку ---
+                brand: editedProduct.brand || "", // Если бренда нет, передаем пустую строку или значение по умолчанию
+                title: editedProduct.title || "", // Наименование товара, maxLength: 60
+                description: editedProduct.description || "", // Описание товара
+
+                dimensions: { // Габариты
+                    length: parseInt(editedProduct.dimensions?.length) || 0,
+                    width: parseInt(editedProduct.dimensions?.width) || 0,
+                    height: parseInt(editedProduct.dimensions?.height) || 0,
+                    // weightBrutto is not in the example for /cards/update, but is in /cards/upload.
+                    // Check if your specific use case requires it and if the API accepts it here.
+                    // If it's there, it's usually part of the main card object, not dimensions.
+                    // The spec shows weightBrutto under dimensions for /content/v2/cards/update
+                    weightBrutto: parseFloat(editedProduct.dimensions?.weightBrutto) || 0,
+                },
+
+                characteristics: editedProduct.characteristics
+                    .filter(char => {
+                        const charIdNumber = parseInt(char.id);
+                        // Фильтруем характеристики: ID должен быть числом, и значение должно быть
+                        // либо не пустым массивом, либо непустой строкой/числом
+                        return !isNaN(charIdNumber) && charIdNumber > 0 &&
+                            char.value &&
+                            (Array.isArray(char.value) ? char.value.length > 0 && char.value.some(v => v !== null && v !== '') : (char.value !== null && char.value !== ''));
+                    })
+                    .map(char => {
+                        // Преобразуем значение в массив, если оно не массив,
+                        // и фильтруем пустые значения из массива
+                        let valArray = Array.isArray(char.value) ? char.value : [char.value];
+                        valArray = valArray.filter(v => v !== null && v !== '').map(v => {
+                            // Пытаемся преобразовать к числу, если это числовая характеристика
+                            // Это упрощение, в идеале нужно проверять char.charcType
+                            const numVal = parseFloat(v);
+                            return isNaN(numVal) ? String(v) : numVal;
+                        });
+
+                        return {
+                            id: parseInt(char.id), // ID характеристики
+                            value: valArray
+                        };
+                    }),
+
+                sizes: editedProduct.sizes.map(size => ({ // Required
+                    chrtID: size.chrtID ? parseInt(size.chrtID) : undefined, // ID размера для существующих размеров
+                    techSize: size.techSize || "", // Размер товара (S, XL, 42)
+                    wbSize: size.wbSize || "", // Российский размер
+                    skus: size.skus || [] // Баркоды. НЕЛЬЗЯ УДАЛЯТЬ существующие, можно добавлять.
+                })),
+                // ВАЖНО: photos, video, tags НЕ обновляются через этот эндпоинт.
+                // Их нужно обновлять через:
+                // Фото/видео: /content/v3/media/file или /content/v3/media/save
+                // Теги: /content/v2/tag/nomenclature/link
             };
 
-            console.log('Отправляем обновление карточки:', updateData);
+            // Тело запроса - это МАССИВ карточек для обновления
+            const requestBody = [cardUpdatePayload];
+
+            console.log('Отправляем обновление карточки (тело запроса):', JSON.stringify(requestBody, null, 2));
 
             const response = await makeWBRequest(`${WB_API_BASE.content}/content/v2/cards/update`, {
                 method: 'POST',
-                body: JSON.stringify(updateData)
+                body: JSON.stringify(requestBody) // Отправляем массив
             });
 
             console.log('Ответ обновления карточки:', response);
 
-            if (response.error) {
-                throw new Error(response.error || 'Ошибка обновления карточки');
+            if (response.error && response.errorText) { // WB часто возвращает error:true с errorText
+                throw new Error(`Ошибка WB: ${response.errorText}${response.additionalErrors ? ' (' + JSON.stringify(response.additionalErrors) + ')' : ''}`);
+            }
+            if (response.data === null && response.error === false && response.errorText === "") {
+                // Успешный ответ, но без данных - это нормально для этого эндпоинта
+                alert('✅ Изменения успешно отправлены на обработку Wildberries!');
+            } else if (response.error) { // Общая обработка ошибок, если предыдущие не сработали
+                throw new Error(response.errorText || response.error.message || 'Неизвестная ошибка обновления карточки');
             }
 
-            if (response.errorText) {
-                throw new Error(response.errorText);
-            }
 
-            alert('✅ Изменения успешно сохранены!');
-
-            // Обновляем данные товара
-            const updatedDetails = await fetchProductDetails(editedProduct);
+            // Обновляем данные товара локально после успешной отправки
+            // В идеале, дождаться подтверждения асинхронной обработки или перезапросить данные
+            const updatedDetails = await fetchProductDetails(editedProduct); // Перезапрашиваем для актуальности
             setProductDetails(updatedDetails);
             setIsEditMode(false);
-            setEditedProduct(null);
+            // setEditedProduct(null); // Можно оставить для отладки или сбросить
+
+            // Обновляем список товаров, если товар там есть
+            setProducts(prevProducts => prevProducts.map(p =>
+                p.nmID === updatedDetails.nmID ? {
+                    ...p,
+                    name: updatedDetails.title,
+                    sku: updatedDetails.vendorCode,
+                    brand: updatedDetails.brand,
+                    // Цены и остатки обновляются другими механизмами, здесь не трогаем
+                } : p
+            ));
+
 
         } catch (error) {
             console.error('Ошибка сохранения изменений:', error);
-            alert(`❌ Ошибка сохранения изменений:\n${error.message}\n\nПроверьте правильность заполнения всех обязательных полей.`);
+            logApiError(error, 'Wildberries (сохранение карточки)');
+            alert(`❌ Ошибка сохранения изменений:\n${error.message}\n\nПроверьте консоль разработчика (F12) для подробной информации. Убедитесь, что все обязательные поля (артикул продавца, размеры) заполнены корректно.`);
         } finally {
             setSavingProduct(false);
         }
@@ -561,7 +670,8 @@ const MarketplaceManagementSystem = () => {
             if (editableProduct.characteristics) {
                 editableProduct.characteristics = editableProduct.characteristics.map(char => ({
                     ...char,
-                    value: Array.isArray(char.value) ? char.value : (char.value ? [char.value] : [])
+                    value: Array.isArray(char.value) ? char.value : (char.value ? [char.value] : []),
+                    popular: char.popular || false
                 }));
             }
 
@@ -738,12 +848,16 @@ const MarketplaceManagementSystem = () => {
                 // Получаем цену из карточки, если не получили через API цен
                 const basePrice = card.sizes?.[0]?.price || 0;
 
+                // Получаем первую фотографию для миниатюры
+                const firstPhoto = card.photos?.[0];
+                const photoUrl = firstPhoto ? (typeof firstPhoto === 'string' ? firstPhoto : firstPhoto.tm) : null;
+
                 return {
                     id: card.nmID,
                     name: card.title || card.subjectName || 'Товар без названия',
                     sku: card.vendorCode || `WB-${card.nmID}`,
                     price: priceInfo.price || basePrice,
-                    discountedPrice: priceInfo.discountedPrice,
+                    discountedPrice: priceInfo.discountedPrice || priceInfo.price || basePrice,
                     discount: priceInfo.discount || 0,
                     stock: totalStock,
                     marketplace: 'Wildberries',
@@ -754,7 +868,8 @@ const MarketplaceManagementSystem = () => {
                     nmID: card.nmID,
                     imtID: card.imtID,
                     createdAt: card.createdAt,
-                    updatedAt: card.updatedAt
+                    updatedAt: card.updatedAt,
+                    photo: photoUrl
                 };
             });
 
@@ -848,45 +963,53 @@ const MarketplaceManagementSystem = () => {
 
     const fetchWBOrders = async () => {
         try {
-            // Получаем новые сборочные задания (заказы)
-            const newOrdersResponse = await makeWBRequest(`${WB_API_BASE.marketplace}/api/v3/orders/new`);
+            // Получаем все заказы без фильтров
+            const params = new URLSearchParams({
+                limit: '1000', // WB ожидает строки для query параметров
+                next: '0',
+                dateFrom: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0], // Последние 30 дней
+                dateTo: new Date().toISOString().split('T')[0]
+            });
 
-            if (!newOrdersResponse || !newOrdersResponse.orders || newOrdersResponse.orders.length === 0) {
-                console.log('Новых заказов не найдено');
+            // Формируем URL с query параметрами
+            const url = `${WB_API_BASE.marketplace}/api/v3/orders?${params.toString()}`;
+
+            console.log('Запрос заказов WB (GET):', url); // Логируем URL
+
+            const ordersResponse = await makeWBRequest(url, {
+                method: 'GET', // ИЗМЕНЕНО НА GET
+                // body: JSON.stringify(...) // Убираем body для GET запроса
+            });
+
+            if (!ordersResponse || !ordersResponse.orders || ordersResponse.orders.length === 0) {
+                console.log('Заказов не найдено');
                 return [];
             }
 
-            // Получаем детальную информацию о заказах
-            const orderIds = newOrdersResponse.orders.map(order => order.id);
-
-            // Запрашиваем подробную информацию по ID заказов
-            const ordersResponse = await makeWBRequest(`${WB_API_BASE.marketplace}/api/v3/orders`, {
-                method: 'GET'
-            });
-
-            const orders = ordersResponse.orders?.map(order => ({
+            const orders = ordersResponse.orders.map(order => ({
                 id: order.id,
-                date: new Date(order.dateCreated).toLocaleDateString('ru-RU'),
-                customer: order.userInfo?.fio || `Покупатель ${order.id}`,
-                total: order.convertedPrice || order.totalPrice || 0,
-                status: getOrderStatus(order.wbStatus),
+                date: new Date(order.createdAt).toLocaleDateString('ru-RU'),
+                customer: order.user?.fio || order.user?.phone || `Заказ ${order.id}`,
+                total: order.convertedPrice || order.price || 0,
+                status: getOrderStatus(order.status || order.wbStatus),
                 marketplace: 'Wildberries',
-                items: 1, // В WB каждое сборочное задание = 1 товар
-                deliveryDate: order.dateCreated ?
-                    new Date(new Date(order.dateCreated).getTime() + 3 * 24 * 60 * 60 * 1000).toLocaleDateString('ru-RU') :
+                items: order.skus?.length || 1,
+                deliveryDate: order.deliveryDate ?
+                    new Date(order.deliveryDate).toLocaleDateString('ru-RU') :
                     'Не указано',
-                phone: order.userInfo?.phone || '',
-                article: order.article || order.supplierArticle,
-                barcode: order.barcode
-            })) || [];
+                phone: order.user?.phone || '',
+                article: order.article || order.supplierArticle || '',
+                barcode: order.skus?.[0] || ''
+            }));
 
             return orders;
         } catch (error) {
             console.error('Ошибка загрузки заказов WB:', error);
 
             // Если нет новых заказов или доступа - не показываем как ошибку
-            if (error.message.includes('404') || error.message.includes('не найдено')) {
-                console.log('Новых заказов не найдено');
+            if (error.message.includes('404') || error.message.includes('не найдено') ||
+                error.message.includes('IncorrectParameter')) {
+                console.log('Новых заказов не найдено или неверный формат запроса');
                 return [];
             }
 
@@ -1360,13 +1483,15 @@ const MarketplaceManagementSystem = () => {
                                     {/* Левая колонка - изображения */}
                                     <div className="space-y-4">
                                         {displayProduct.photos && displayProduct.photos.length > 0 ? (
-                                            <div className="grid grid-cols-2 gap-2">
+                                            <div className="grid grid-cols-2 gap-4">
                                                 {displayProduct.photos.slice(0, 4).map((photo, index) => {
                                                     const photoUrl = typeof photo === 'string'
-                                                        ? photo
-                                                        : (photo.big ? `https://images.wbstatic.net/big/${photo.big}` :
-                                                            photo.small ? `https://images.wbstatic.net/tm/${photo.small}` :
-                                                                photo);
+                                                        ? photo.startsWith('http')
+                                                            ? photo
+                                                            : `${photo}`
+                                                        : (photo.big ? `${photo.big}` :
+                                                            photo.tm ? `${photo.tm}` :
+                                                                '');
 
                                                     return (
                                                         <div key={index} className="aspect-square bg-gray-100 rounded-lg overflow-hidden">
@@ -1406,7 +1531,7 @@ const MarketplaceManagementSystem = () => {
                                                     </span>
                                                 )}
                                             </div>
-                                            {displayProduct.discountedPrice && displayProduct.discountedPrice !== displayProduct.price ? (
+                                            {displayProduct.discountedPrice && displayProduct.discountedPrice !== displayProduct.price && displayProduct.discountedPrice > 0 ? (
                                                 <div className="flex items-center gap-3">
                                                     <span className="text-2xl font-bold text-green-600">
                                                         ₽{displayProduct.discountedPrice.toLocaleString()}
@@ -1419,6 +1544,11 @@ const MarketplaceManagementSystem = () => {
                                                 <span className="text-2xl font-bold text-blue-800">
                                                     ₽{displayProduct.price?.toLocaleString() || '0'}
                                                 </span>
+                                            )}
+                                            {displayProduct.sizes && displayProduct.sizes.length > 0 && displayProduct.sizes[0].price > 0 && (
+                                                <div className="text-xs text-gray-500 mt-2">
+                                                    Цена из карточки: ₽{displayProduct.sizes[0].price.toLocaleString()}
+                                                </div>
                                             )}
                                         </div>
 
@@ -1530,7 +1660,8 @@ const MarketplaceManagementSystem = () => {
                                                                 name: cat.name,
                                                                 required: cat.required || false,
                                                                 unitName: cat.unitName,
-                                                                value: []
+                                                                value: [],
+                                                                popular: cat.popular || false
                                                             }));
 
                                                         setEditedProduct({
@@ -1544,36 +1675,96 @@ const MarketplaceManagementSystem = () => {
                                                 </button>
                                             )}
                                         </h3>
-                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                                            {displayProduct.characteristics.map((char, index) => (
-                                                <div key={char.id || index} className="border border-gray-100 rounded-lg p-3">
-                                                    <div className="font-medium text-gray-800 mb-1 flex items-center gap-1">
-                                                        {char.name}
-                                                        {char.required && <span className="text-red-500">*</span>}
+
+                                        {isEditMode && (
+                                            <div className="mb-4 p-3 bg-gray-50 rounded-lg">
+                                                <div className="text-sm text-gray-600">
+                                                    <span className="font-medium">Статус заполнения:</span>
+                                                    <div className="flex items-center gap-4 mt-1">
+                                                        <span className="flex items-center gap-1">
+                                                            <span className="w-3 h-3 bg-green-500 rounded-full"></span>
+                                                            <span>Заполнено: {displayProduct.characteristics.filter(char =>
+                                                                Array.isArray(char.value) ? char.value.length > 0 && char.value[0] !== '' : char.value
+                                                            ).length}</span>
+                                                        </span>
+                                                        <span className="flex items-center gap-1">
+                                                            <span className="w-3 h-3 bg-yellow-500 rounded-full"></span>
+                                                            <span>Не заполнено: {displayProduct.characteristics.filter(char =>
+                                                                !char.value || (Array.isArray(char.value) && (char.value.length === 0 || char.value[0] === '')) || (!Array.isArray(char.value) && !char.value)
+                                                            ).length}</span>
+                                                        </span>
+                                                        <span className="flex items-center gap-1">
+                                                            <span className="w-3 h-3 bg-red-500 rounded-full"></span>
+                                                            <span>Обязательных: {displayProduct.characteristics.filter(char => char.required).length}</span>
+                                                        </span>
                                                     </div>
-                                                    {isEditMode ? (
-                                                        <input
-                                                            type="text"
-                                                            value={Array.isArray(char.value) ? char.value[0] || '' : char.value || ''}
-                                                            onChange={(e) => updateCharacteristic(char.id, e.target.value)}
-                                                            className="w-full px-2 py-1 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                                                            placeholder={char.required ? 'Обязательное поле' : 'Необязательное поле'}
-                                                        />
-                                                    ) : (
-                                                        <div className="text-sm text-gray-600">
-                                                            {Array.isArray(char.value)
-                                                                ? (char.value.length > 0 ? char.value.join(', ') : 'Не указано')
-                                                                : (char.value || 'Не указано')
-                                                            }
-                                                        </div>
-                                                    )}
-                                                    {char.unitName && (
-                                                        <div className="text-xs text-gray-500 mt-1">
-                                                            Единица: {char.unitName}
-                                                        </div>
-                                                    )}
                                                 </div>
-                                            ))}
+                                            </div>
+                                        )}
+
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                            {displayProduct.characteristics
+                                                .sort((a, b) => {
+                                                    // Сортировка: обязательные -> популярные -> остальные
+                                                    if (a.required && !b.required) return -1;
+                                                    if (!a.required && b.required) return 1;
+                                                    if (a.popular && !b.popular) return -1;
+                                                    if (!a.popular && b.popular) return 1;
+                                                    return 0;
+                                                })
+                                                .map((char, index) => {
+                                                    const isFilled = Array.isArray(char.value)
+                                                        ? char.value.length > 0 && char.value[0] !== ''
+                                                        : !!char.value;
+
+                                                    return (
+                                                        <div key={char.id || index} className={`border rounded-lg p-3 ${
+                                                            isEditMode
+                                                                ? isFilled
+                                                                    ? 'border-green-300 bg-green-50'
+                                                                    : char.required
+                                                                        ? 'border-red-300 bg-red-50'
+                                                                        : 'border-gray-200 bg-yellow-50'
+                                                                : 'border-gray-100'
+                                                        }`}>
+                                                            <div className="font-medium text-gray-800 mb-1 flex items-center gap-1">
+                                                                {char.name}
+                                                                {char.required && <span className="text-red-500">*</span>}
+                                                                {char.popular && !char.required && (
+                                                                    <Star size={12} className="text-yellow-500 fill-current" title="Популярная характеристика" />
+                                                                )}
+                                                                {isEditMode && (
+                                                                    <span className={`ml-auto text-xs ${
+                                                                        isFilled ? 'text-green-600' : 'text-gray-400'
+                                                                    }`}>
+                                                                        {isFilled ? '✓' : '○'}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                            {isEditMode ? (
+                                                                <input
+                                                                    type="text"
+                                                                    value={Array.isArray(char.value) ? char.value[0] || '' : char.value || ''}
+                                                                    onChange={(e) => updateCharacteristic(char.id, e.target.value)}
+                                                                    className="w-full px-2 py-1 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                                    placeholder={char.required ? 'Обязательное поле' : char.popular ? 'Рекомендуется заполнить' : 'Необязательное поле'}
+                                                                />
+                                                            ) : (
+                                                                <div className="text-sm text-gray-600">
+                                                                    {Array.isArray(char.value)
+                                                                        ? (char.value.length > 0 ? char.value.join(', ') : 'Не указано')
+                                                                        : (char.value || 'Не указано')
+                                                                    }
+                                                                </div>
+                                                            )}
+                                                            {char.unitName && (
+                                                                <div className="text-xs text-gray-500 mt-1">
+                                                                    Единица: {char.unitName}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    );
+                                                })}
                                         </div>
                                     </div>
                                 )}
@@ -2177,11 +2368,24 @@ const MarketplaceManagementSystem = () => {
                             </tr>
                         ) : (
                             products.map((product) => (
-                                <tr key={product.id} className="hover:bg-gray-50">
+                                <tr key={`${product.id}-${product.nmID}`} className="hover:bg-gray-50">
                                     <td className="px-4 py-4 whitespace-nowrap">
                                         <div className="flex items-center max-w-xs">
-                                            <div className="h-10 w-10 bg-gray-200 rounded-lg mr-3 flex items-center justify-center flex-shrink-0">
-                                                <Package className="text-gray-400" size={20} />
+                                            <div className="h-10 w-10 bg-gray-200 rounded-lg mr-3 flex items-center justify-center flex-shrink-0 overflow-hidden">
+                                                {product.photo ? (
+                                                    <img
+                                                        src={`${product.photo}`}
+                                                        alt={product.name}
+                                                        className="w-full h-full object-cover"
+                                                        onError={(e) => {
+                                                            e.target.style.display = 'none';
+                                                            e.target.nextSibling.style.display = 'flex';
+                                                        }}
+                                                    />
+                                                ) : null}
+                                                <div className={`${product.photo ? 'hidden' : 'flex'} items-center justify-center w-full h-full`}>
+                                                    <Package className="text-gray-400" size={20} />
+                                                </div>
                                             </div>
                                             <div className="min-w-0 flex-1">
                                                 <div className="text-sm font-medium text-gray-900 truncate" title={product.name}>
