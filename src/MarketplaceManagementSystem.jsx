@@ -804,9 +804,8 @@ const MarketplaceManagementSystem = () => {
             for (const product of selectedProducts) {
                 const updatePayload = {
                     nmID: product.nmID,
-                    vendorCode: product.sku
+                    vendorCode: product.sku // или product.vendorCode, если это правильный артикул продавца
                 };
-
                 // Применяем только включенные изменения
                 if (bulkEditData.brand.enabled) {
                     updatePayload.brand = bulkEditData.brand.value;
@@ -830,7 +829,28 @@ const MarketplaceManagementSystem = () => {
                             value: [char.value]
                         }));
                 }
-
+                if (product.sizes && product.sizes.length > 0) {
+                    updatePayload.sizes = product.sizes.map(s => ({
+                        chrtID: s.chrtID, // Обязательно для существующих размеров
+                        techSize: s.techSize,
+                        wbSize: s.wbSize,
+                        skus: s.skus,
+                        // Если вы массово редактируете цену через этот же эндпоинт,
+                        // то цена размера должна быть обновлена здесь.
+                        // Если цена редактируется через prices API, то оставляем текущую s.price.
+                        price: bulkEditData.price.enabled ? bulkEditData.price.value : s.price
+                    }));
+                } else {
+                    // Если по какой-то причине у товара нет размеров (что маловероятно для существующих)
+                    // или product.sizes не был загружен, создаем минимальный размер, как в одиночном редактировании
+                    console.warn(`Товар ${product.nmID} не имеет размеров в данных. Создаем дефолтный размер.`);
+                    updatePayload.sizes = [{
+                        techSize: "0", // или какой-то дефолтный techSize, если известен
+                        wbSize: "",
+                        skus: product.barcode ? [product.barcode] : [],
+                        price: bulkEditData.price.enabled ? bulkEditData.price.value : product.price // Используем общую цену товара
+                    }];
+                }
                 updatePromises.push(updatePayload);
             }
 
@@ -1203,8 +1223,16 @@ const MarketplaceManagementSystem = () => {
                     createdAt: card.createdAt,
                     updatedAt: card.updatedAt,
                     photo: photoUrl,
-                    needKiz: card.needKiz || false, // Новое поле для маркировки "Честный знак"
-                    hasPhoto: !!(card.photos && card.photos.length > 0)
+                    needKiz: card.needKiz || false,
+                    hasPhoto: !!(card.photos && card.photos.length > 0),
+                    // ДОБАВЬТЕ ЭТО:
+                    sizes: card.sizes?.map(s => ({
+                        chrtID: s.chrtID,
+                        techSize: s.techSize,
+                        wbSize: s.wbSize,
+                        skus: s.skus,
+                        price: s.price // Важно сохранить цену размера, если она есть
+                    })) || [] // Сохраняем все размеры в нужном формате
                 };
             });
 
