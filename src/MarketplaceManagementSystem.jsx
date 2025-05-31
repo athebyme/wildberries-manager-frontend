@@ -8,10 +8,11 @@ import {
     Home, Box, FileText, BarChart3, Bell, Search, Plus,
     Filter, Download, Eye, Edit, Trash2, AlertCircle,
     CheckCircle, Clock, DollarSign, Store, TrendingDown,
-    Calendar, RefreshCw, Upload, ChevronDown, User,
-    Lock, CreditCard, Shield, Key, Save, Loader,
-    Check, X, AlertTriangle, Mail, Phone, Building,
-    ChevronLeft, Star, Tag, Info, ExternalLink, Edit3
+    RefreshCw, Upload, ChevronDown, User,
+    Lock, Save, Loader,
+    Check, X,
+    ChevronLeft, Star, Tag, Info, ExternalLink, Edit3,
+    AlertTriangle
 } from 'lucide-react';
 
 const MarketplaceManagementSystem = () => {
@@ -24,6 +25,19 @@ const MarketplaceManagementSystem = () => {
         ozon: { clientId: '', apiKey: '' },
         yandex: ''
     });
+
+    const [pageSize, setPageSize] = useState(50);
+    const [customPageSize, setCustomPageSize] = useState('');
+    const [showCustomPageSize, setShowCustomPageSize] = useState(false);
+    const [searchFilters, setSearchFilters] = useState({
+        withPhoto: -1, // -1: все, 0: без фото, 1: с фото
+        textSearch: '',
+        showOnlyWithStock: false,
+        showOnlyActive: false,
+        sortBy: 'updatedAt', // updatedAt, createdAt, nmID
+        sortOrder: 'desc' // desc, asc
+    });
+
     const [products, setProducts] = useState([]);
     const [orders, setOrders] = useState([]);
     const [apiErrors, setApiErrors] = useState([]);
@@ -78,6 +92,32 @@ const MarketplaceManagementSystem = () => {
         statistics: 'https://statistics-api.wildberries.ru',
         prices: 'https://prices-api.wildberries.ru'
     };
+
+    // Лимиты API Wildberries
+    const WB_API_LIMITS = {
+        content: 100, // запросов в минуту для контента
+        marketplace: 300, // запросов в минуту для маркетплейса
+        prices: 100, // запросов в минуту для цен
+        maxProductsPerRequest: 100, // максимум товаров за один запрос
+        maxTotalProducts: 1000 // максимум товаров для загрузки за раз
+    };
+
+    // Состояния для массового редактирования
+    const [selectedProductIds, setSelectedProductIds] = useState(new Set());
+    const [showBulkEditModal, setShowBulkEditModal] = useState(false);
+    const [bulkEditData, setBulkEditData] = useState({
+        brand: { enabled: false, value: '' },
+        price: { enabled: false, value: 0 },
+        dimensions: {
+            enabled: false,
+            value: { length: '', width: '', height: '' }
+        },
+        characteristics: []
+    });
+    const [bulkEditMode, setBulkEditMode] = useState('common'); // 'common' или 'category'
+    const [selectedCategoryForBulk, setSelectedCategoryForBulk] = useState(null);
+    const [bulkSaving, setBulkSaving] = useState(false);
+    const [loadingProgress, setLoadingProgress] = useState({ current: 0, total: 0 });
 
     const makeWBRequest = async (url, options = {}) => {
         const defaultHeaders = {
@@ -502,137 +542,343 @@ const MarketplaceManagementSystem = () => {
     const saveProductChanges = async () => {
         if (!editedProduct) return;
 
-        // Проверка обязательных полей (если у вас есть эта логика)
-        const requiredCharacteristics = editedProduct.characteristics.filter(char => char.required);
+        // Расширенная валидация обязательных полей
+        const requiredCharacteristics = editedProduct.characteristics?.filter(char => char.required) || [];
         const emptyRequired = requiredCharacteristics.filter(char =>
-            !char.value || (Array.isArray(char.value) && char.value.length === 0) ||
-            (Array.isArray(char.value) && char.value[0] === '')
+            !char.value ||
+            (Array.isArray(char.value) && (char.value.length === 0 || char.value.every(v => !v || v.toString().trim() === ''))) ||
+            (!Array.isArray(char.value) && (!char.value || char.value.toString().trim() === ''))
         );
 
-        if (emptyRequired.length > 0) {
-            alert(`❌ Заполните обязательные характеристики:\n${emptyRequired.map(char => `• ${char.name}`).join('\n')}`);
-            return;
-        }
-        if (!editedProduct.vendorCode) {
-            alert('❌ Артикул продавца (vendorCode) является обязательным полем.');
-            return;
-        }
-        if (!editedProduct.sizes || editedProduct.sizes.length === 0) {
-            alert('❌ Необходимо указать хотя бы один размер (массив sizes).');
-            return;
+        // Базовая валидация обязательных полей
+        const validationErrors = [];
+
+        if (!editedProduct.vendorCode || editedProduct.vendorCode.trim() === '') {
+            validationErrors.push('Артикул продавца (vendorCode) является обязательным полем');
         }
 
+        if (!editedProduct.sizes || editedProduct.sizes.length === 0) {
+            validationErrors.push('Необходимо указать хотя бы один размер');
+        }
+
+        if (!editedProduct.title || editedProduct.title.trim() === '') {
+            validationErrors.push('Название товара является обязательным полем');
+        }
+
+        if (editedProduct.title && editedProduct.title.length > 60) {
+            validationErrors.push('Название товара не должно превышать 60 символов');
+        }
+
+        // Проверка корректности размеров
+        const invalidSizes = editedProduct.sizes?.filter(size => !size.techSize || size.techSize.trim() === '') || [];
+        if (invalidSizes.length > 0) {
+            validationErrors.push('Все размеры должны иметь технический размер (techSize)');
+        }
+
+        // Проверка габаритов (если указаны)
+        if (editedProduct.dimensions) {
+            const { length, width, height } = editedProduct.dimensions;
+            if ((length && length <= 0) || (width && width <= 0) || (height && height <= 0)) {
+                validationErrors.push('Габариты должны быть положительными числами в сантиметрах');
+            }
+        }
+
+        if (emptyRequired.length > 0) {
+            validationErrors.push(`Заполните обязательные характеристики: ${emptyRequired.map(char => char.name).join(', ')}`);
+        }
+
+        if (validationErrors.length > 0) {
+            alert(`❌ Ошибки валидации:\n\n${validationErrors.map(error => `• ${error}`).join('\n')}`);
+            return;
+        }
 
         setSavingProduct(true);
         try {
-            // Подготавливаем данные для обновления согласно спецификации /content/v2/cards/update
+            // Подготавливаем данные строго по спецификации API /content/v2/cards/update
             const cardUpdatePayload = {
-                nmID: editedProduct.nmID, // Required
-                vendorCode: editedProduct.vendorCode, // Required
-                // --- Эти поля должны быть переданы, т.к. API перезаписывает карточку ---
-                brand: editedProduct.brand || "", // Если бренда нет, передаем пустую строку или значение по умолчанию
-                title: editedProduct.title || "", // Наименование товара, maxLength: 60
-                description: editedProduct.description || "", // Описание товара
+                nmID: parseInt(editedProduct.nmID), // Required: ID номенклатуры (число)
+                vendorCode: editedProduct.vendorCode.trim(), // Required: Артикул продавца
+                brand: editedProduct.brand?.trim() || "", // Бренд
+                title: editedProduct.title?.trim() || "", // Наименование товара (макс. 60 символов)
+                description: editedProduct.description?.trim() || "", // Описание товара
 
-                dimensions: { // Габариты
-                    length: parseInt(editedProduct.dimensions?.length) || 0,
-                    width: parseInt(editedProduct.dimensions?.width) || 0,
-                    height: parseInt(editedProduct.dimensions?.height) || 0,
-                    // weightBrutto is not in the example for /cards/update, but is in /cards/upload.
-                    // Check if your specific use case requires it and if the API accepts it here.
-                    // If it's there, it's usually part of the main card object, not dimensions.
-                    // The spec shows weightBrutto under dimensions for /content/v2/cards/update
-                    weightBrutto: parseFloat(editedProduct.dimensions?.weightBrutto) || 0,
+                // Габариты в сантиметрах (обязательны для обновления)
+                dimensions: {
+                    length: Math.max(0, parseInt(editedProduct.dimensions?.length) || 0),
+                    width: Math.max(0, parseInt(editedProduct.dimensions?.width) || 0),
+                    height: Math.max(0, parseInt(editedProduct.dimensions?.height) || 0),
+                    isValid: true // Флаг валидности габаритов
                 },
 
-                characteristics: editedProduct.characteristics
+                // Характеристики товара
+                characteristics: (editedProduct.characteristics || [])
                     .filter(char => {
+                        // Фильтруем только характеристики с корректными ID и значениями
                         const charIdNumber = parseInt(char.id);
-                        // Фильтруем характеристики: ID должен быть числом, и значение должно быть
-                        // либо не пустым массивом, либо непустой строкой/числом
-                        return !isNaN(charIdNumber) && charIdNumber > 0 &&
-                            char.value &&
-                            (Array.isArray(char.value) ? char.value.length > 0 && char.value.some(v => v !== null && v !== '') : (char.value !== null && char.value !== ''));
+                        return !isNaN(charIdNumber) && charIdNumber > 0 && char.value && (
+                            Array.isArray(char.value)
+                                ? char.value.length > 0 && char.value.some(v => v && v.toString().trim() !== '')
+                                : char.value.toString().trim() !== ''
+                        );
                     })
                     .map(char => {
-                        // Преобразуем значение в массив, если оно не массив,
-                        // и фильтруем пустые значения из массива
-                        let valArray = Array.isArray(char.value) ? char.value : [char.value];
-                        valArray = valArray.filter(v => v !== null && v !== '').map(v => {
-                            // Пытаемся преобразовать к числу, если это числовая характеристика
-                            // Это упрощение, в идеале нужно проверять char.charcType
-                            const numVal = parseFloat(v);
-                            return isNaN(numVal) ? String(v) : numVal;
-                        });
+                        // Преобразуем значения в правильный формат
+                        let valueArray = Array.isArray(char.value) ? char.value : [char.value];
+                        valueArray = valueArray
+                            .filter(v => v && v.toString().trim() !== '')
+                            .map(v => v.toString().trim());
 
                         return {
-                            id: parseInt(char.id), // ID характеристики
-                            value: valArray
+                            id: parseInt(char.id),
+                            value: valueArray
                         };
                     }),
 
-                sizes: editedProduct.sizes.map(size => ({ // Required
-                    chrtID: size.chrtID ? parseInt(size.chrtID) : undefined, // ID размера для существующих размеров
-                    techSize: size.techSize || "", // Размер товара (S, XL, 42)
-                    wbSize: size.wbSize || "", // Российский размер
-                    skus: size.skus || [] // Баркоды. НЕЛЬЗЯ УДАЛЯТЬ существующие, можно добавлять.
-                })),
-                // ВАЖНО: photos, video, tags НЕ обновляются через этот эндпоинт.
-                // Их нужно обновлять через:
-                // Фото/видео: /content/v3/media/file или /content/v3/media/save
-                // Теги: /content/v2/tag/nomenclature/link
+                // Размеры товара (обязательные)
+                sizes: (() => {
+                    const sizes = editedProduct.sizes || [];
+
+                    // Если размеров нет, создаем дефолтный размер
+                    if (sizes.length === 0) {
+                        console.warn('Нет размеров, создаем дефолтный размер');
+                        return [{
+                            techSize: "0", // Технический размер по умолчанию
+                            wbSize: "", // Размер WB может быть пустым
+                            skus: editedProduct.barcode ? [editedProduct.barcode] : []
+                        }];
+                    }
+
+                    // Мапим существующие размеры
+                    return sizes.map(size => {
+                        const sizeData = {
+                            techSize: size.techSize?.trim() || "0", // Если нет техразмера, ставим "0"
+                            wbSize: size.wbSize?.trim() || "", // Размер WB
+                            skus: Array.isArray(size.skus) ? size.skus.filter(sku => sku && sku.trim()) : []
+                        };
+
+                        // Если нет SKU, пытаемся взять из баркода товара
+                        if (sizeData.skus.length === 0 && editedProduct.barcode) {
+                            sizeData.skus = [editedProduct.barcode];
+                        }
+
+                        // Добавляем chrtID только если он существует (для обновления существующих размеров)
+                        if (size.chrtID && !isNaN(parseInt(size.chrtID))) {
+                            sizeData.chrtID = parseInt(size.chrtID);
+                        }
+
+                        // Добавляем price если есть
+                        if (size.price && !isNaN(parseInt(size.price))) {
+                            sizeData.price = parseInt(size.price);
+                        }
+
+                        return sizeData;
+                    });
+                })()
             };
 
-            // Тело запроса - это МАССИВ карточек для обновления
+            // Тело запроса - массив карточек (максимум 3000 номенклатур за запрос)
             const requestBody = [cardUpdatePayload];
 
-            console.log('Отправляем обновление карточки (тело запроса):', JSON.stringify(requestBody, null, 2));
+            console.log('Отправляем обновление карточки:', JSON.stringify(requestBody, null, 2));
 
             const response = await makeWBRequest(`${WB_API_BASE.content}/content/v2/cards/update`, {
                 method: 'POST',
-                body: JSON.stringify(requestBody) // Отправляем массив
+                body: JSON.stringify(requestBody)
             });
 
-            console.log('Ответ обновления карточки:', response);
+            console.log('Ответ от API обновления карточки:', response);
 
-            if (response.error && response.errorText) { // WB часто возвращает error:true с errorText
-                throw new Error(`Ошибка WB: ${response.errorText}${response.additionalErrors ? ' (' + JSON.stringify(response.additionalErrors) + ')' : ''}`);
+            // Обработка ответа согласно документации WB API
+            if (response.error === true && response.errorText) {
+                let errorMessage = `Ошибка WB API: ${response.errorText}`;
+                if (response.additionalErrors) {
+                    errorMessage += `\nДополнительные ошибки: ${JSON.stringify(response.additionalErrors)}`;
+                }
+                throw new Error(errorMessage);
             }
-            if (response.data === null && response.error === false && response.errorText === "") {
-                // Успешный ответ, но без данных - это нормально для этого эндпоинта
-                alert('✅ Изменения успешно отправлены на обработку Wildberries!');
-            } else if (response.error) { // Общая обработка ошибок, если предыдущие не сработали
-                throw new Error(response.errorText || response.error.message || 'Неизвестная ошибка обновления карточки');
+
+            if (response.error === false && (response.data === null || response.data === undefined)) {
+                // Успешный ответ - обновление поставлено в очередь на обработку
+                alert('✅ Изменения карточки успешно отправлены на обработку в Wildberries!\n\nОбработка может занять несколько минут. Проверьте результат в личном кабинете.');
+
+                // Перезагружаем данные товара для получения актуальной информации
+                try {
+                    const updatedDetails = await fetchProductDetails(editedProduct);
+                    setProductDetails(updatedDetails);
+                    setIsEditMode(false);
+
+                    // Обновляем товар в общем списке
+                    setProducts(prevProducts => prevProducts.map(p =>
+                        p.nmID === updatedDetails.nmID ? {
+                            ...p,
+                            name: updatedDetails.title || p.name,
+                            sku: updatedDetails.vendorCode || p.sku,
+                            brand: updatedDetails.brand || p.brand
+                        } : p
+                    ));
+                } catch (reloadError) {
+                    console.warn('Не удалось перезагрузить данные товара после обновления:', reloadError);
+                }
+
+            } else if (response.error) {
+                // Обработка других ошибок
+                throw new Error(response.errorText || 'Неизвестная ошибка при обновлении карточки');
             }
-
-
-            // Обновляем данные товара локально после успешной отправки
-            // В идеале, дождаться подтверждения асинхронной обработки или перезапросить данные
-            const updatedDetails = await fetchProductDetails(editedProduct); // Перезапрашиваем для актуальности
-            setProductDetails(updatedDetails);
-            setIsEditMode(false);
-            // setEditedProduct(null); // Можно оставить для отладки или сбросить
-
-            // Обновляем список товаров, если товар там есть
-            setProducts(prevProducts => prevProducts.map(p =>
-                p.nmID === updatedDetails.nmID ? {
-                    ...p,
-                    name: updatedDetails.title,
-                    sku: updatedDetails.vendorCode,
-                    brand: updatedDetails.brand,
-                    // Цены и остатки обновляются другими механизмами, здесь не трогаем
-                } : p
-            ));
-
 
         } catch (error) {
-            console.error('Ошибка сохранения изменений:', error);
-            logApiError(error, 'Wildberries (сохранение карточки)');
-            alert(`❌ Ошибка сохранения изменений:\n${error.message}\n\nПроверьте консоль разработчика (F12) для подробной информации. Убедитесь, что все обязательные поля (артикул продавца, размеры) заполнены корректно.`);
+            console.error('Ошибка сохранения изменений карточки:', error);
+            logApiError(error, 'Wildberries (обновление карточки)');
+
+            let userMessage = '❌ Ошибка сохранения изменений:\n\n';
+
+            if (error.message.includes('400')) {
+                userMessage += 'Некорректные данные в запросе. Проверьте:\n• Все обязательные поля заполнены\n• Артикул продавца указан корректно\n• Размеры и габариты указаны правильно\n• Характеристики заполнены в соответствии с требованиями категории';
+            } else if (error.message.includes('401')) {
+                userMessage += 'Ошибка авторизации. Проверьте правильность API ключа в настройках.';
+            } else if (error.message.includes('403')) {
+                userMessage += 'Недостаточно прав доступа. Убедитесь, что API ключ имеет права на категорию "Контент".';
+            } else if (error.message.includes('429')) {
+                userMessage += 'Превышен лимит запросов API (100 запросов/минуту). Подождите минуту и попробуйте снова.';
+            } else {
+                userMessage += error.message;
+            }
+
+            userMessage += '\n\nПодробная информация об ошибке в консоли разработчика (F12).';
+            alert(userMessage);
+
         } finally {
             setSavingProduct(false);
         }
     };
+
+    // Выбор/снятие выбора товара
+    const toggleProductSelection = (productId) => {
+        setSelectedProductIds(prev => {
+            const newSet = new Set(prev);
+            if (newSet.has(productId)) {
+                newSet.delete(productId);
+            } else {
+                newSet.add(productId);
+            }
+            return newSet;
+        });
+    };
+
+// Выбрать все товары на странице
+    const selectAllProducts = () => {
+        const allIds = new Set(products.map(p => p.nmID));
+        setSelectedProductIds(allIds);
+    };
+
+// Снять выделение со всех товаров
+    const clearSelection = () => {
+        setSelectedProductIds(new Set());
+    };
+
+// Открыть модальное окно массового редактирования
+    const openBulkEditModal = async () => {
+        if (selectedProductIds.size === 0) return;
+
+        // Определяем общие категории среди выбранных товаров
+        const selectedProducts = products.filter(p => selectedProductIds.has(p.nmID));
+        const categories = [...new Set(selectedProducts.map(p => p.category))];
+
+        if (categories.length === 1) {
+            // Все товары одной категории - можем загрузить характеристики
+            setSelectedCategoryForBulk(categories[0]);
+            // Здесь можно загрузить характеристики категории
+        } else {
+            setSelectedCategoryForBulk(null);
+        }
+
+        setShowBulkEditModal(true);
+    };
+
+// Применить массовые изменения
+    const applyBulkChanges = async () => {
+        setBulkSaving(true);
+        try {
+            const selectedProducts = products.filter(p => selectedProductIds.has(p.nmID));
+            const updatePromises = [];
+
+            for (const product of selectedProducts) {
+                const updatePayload = {
+                    nmID: product.nmID,
+                    vendorCode: product.sku
+                };
+
+                // Применяем только включенные изменения
+                if (bulkEditData.brand.enabled) {
+                    updatePayload.brand = bulkEditData.brand.value;
+                }
+
+                if (bulkEditData.dimensions.enabled) {
+                    updatePayload.dimensions = {
+                        length: parseInt(bulkEditData.dimensions.value.length) || 0,
+                        width: parseInt(bulkEditData.dimensions.value.width) || 0,
+                        height: parseInt(bulkEditData.dimensions.value.height) || 0,
+                        isValid: true
+                    };
+                }
+
+                // Добавляем характеристики если включены
+                if (bulkEditData.characteristics.length > 0) {
+                    updatePayload.characteristics = bulkEditData.characteristics
+                        .filter(char => char.enabled && char.value)
+                        .map(char => ({
+                            id: parseInt(char.id),
+                            value: [char.value]
+                        }));
+                }
+
+                updatePromises.push(updatePayload);
+            }
+
+            // Отправляем батчами по 100 товаров (лимит API)
+            const batchSize = 100;
+            let successCount = 0;
+
+            for (let i = 0; i < updatePromises.length; i += batchSize) {
+                const batch = updatePromises.slice(i, i + batchSize);
+
+                try {
+                    await makeWBRequest(`${WB_API_BASE.content}/content/v2/cards/update`, {
+                        method: 'POST',
+                        body: JSON.stringify(batch)
+                    });
+                    successCount += batch.length;
+
+                    // Задержка между батчами
+                    if (i + batchSize < updatePromises.length) {
+                        await delay(1000);
+                    }
+                } catch (error) {
+                    console.error('Ошибка обновления батча:', error);
+                    logApiError(error, 'Wildberries (массовое обновление)');
+                }
+            }
+
+            alert(`✅ Успешно обновлено ${successCount} из ${selectedProductIds.size} товаров`);
+
+            // Перезагружаем данные
+            await fetchMarketplaceData(selectedMarketplace);
+            setShowBulkEditModal(false);
+            setBulkEditData({
+                brand: { enabled: false, value: '' },
+                price: { enabled: false, value: 0 },
+                dimensions: { enabled: false, value: { length: '', width: '', height: '' } },
+                characteristics: []
+            });
+            clearSelection();
+
+        } catch (error) {
+            console.error('Ошибка массового обновления:', error);
+            alert('❌ Произошла ошибка при массовом обновлении товаров');
+        } finally {
+            setBulkSaving(false);
+        }
+    };
+
 
     // Открыть карточку товара
     const openProductCard = async (product) => {
@@ -713,70 +959,154 @@ const MarketplaceManagementSystem = () => {
         }));
     };
 
-    const fetchWBProductsWithPagination = async (cursor = null, searchText = '', isLoadMore = false) => {
+    const fetchWBProductsWithPagination = async (cursor = null, searchText = '', isLoadMore = false, customFilters = null) => {
         try {
-            // Строим фильтр для поиска
-            const filter = { withPhoto: -1 };
-
-            if (searchText.trim()) {
-                // Проверяем, является ли поиск числом (nmID) или текстом (артикул)
-                const searchValue = searchText.trim();
-                if (/^\d+$/.test(searchValue)) {
-                    // Если только цифры - ищем по nmID
-                    filter.textSearch = searchValue;
-                } else {
-                    // Если есть буквы - ищем по артикулу/названию
-                    filter.textSearch = searchValue;
-                }
-            }
-
-            const requestBody = {
-                settings: {
-                    cursor: {
-                        limit: 30, // Оптимальный лимит для быстрой загрузки
-                        ...(cursor || {})
-                    },
-                    filter
-                }
-            };
-
-            console.log('Запрос товаров:', requestBody);
-
-            const cardsResponse = await makeWBRequest(`${WB_API_BASE.content}/content/v2/get/cards/list`, {
-                method: 'POST',
-                body: JSON.stringify(requestBody)
+            // Используем переданные фильтры или дефолтные значения
+            const activeFilters = customFilters || (typeof searchFilters !== 'undefined' ? searchFilters : {
+                withPhoto: -1,
+                textSearch: '',
+                showOnlyWithStock: false,
+                showOnlyActive: false,
+                sortBy: 'updatedAt',
+                sortOrder: 'desc'
             });
 
-            console.log('Ответ карточек:', cardsResponse);
+            // Строим фильтр для поиска согласно API документации
+            const filter = {
+                withPhoto: activeFilters.withPhoto // -1: все, 0: без фото, 1: с фото
+            };
 
-            if (!cardsResponse?.cards || cardsResponse.cards.length === 0) {
-                return { products: [], cursor: cardsResponse?.cursor || null, hasMore: false };
+            // Добавляем текстовый поиск
+            const searchValue = (searchText || activeFilters.textSearch || '').trim();
+            if (searchValue) {
+                filter.textSearch = searchValue;
             }
 
-            // Задержка между запросами карточек и дополнительных данных
+            // Определяем желаемый размер страницы
+            const desiredPageSize = customPageSize || pageSize || 50;
+
+            // WB API лимит: максимум 100 карточек за запрос
+            const maxCardsPerRequest = 100;
+
+            // Рассчитываем сколько запросов нужно сделать
+            const requestsNeeded = Math.ceil(Math.min(desiredPageSize, 1000) / maxCardsPerRequest);
+
+            console.log(`Планируется ${requestsNeeded} запросов для получения ${desiredPageSize} товаров (макс. ${maxCardsPerRequest} за запрос)`);
+
+            // Показываем прогресс для больших запросов
+            if (desiredPageSize > 100) {
+                setLoadingProgress({ current: 0, total: requestsNeeded });
+            }
+
+            let allCards = [];
+            let currentCursor = cursor;
+            let finalCursor = null;
+
+            // Делаем серию запросов для получения нужного количества товаров
+            for (let requestIndex = 0; requestIndex < requestsNeeded; requestIndex++) {
+                // Обновляем прогресс
+                if (desiredPageSize > 100) {
+                    setLoadingProgress({ current: requestIndex + 1, total: requestsNeeded });
+                }
+                // Определяем лимит для текущего запроса
+                const remainingCards = desiredPageSize - allCards.length;
+                const currentLimit = Math.min(maxCardsPerRequest, remainingCards);
+
+                if (currentLimit <= 0) break;
+
+                const requestCursor = {
+                    limit: currentLimit,
+                    ...(currentCursor || {})
+                };
+
+                const requestBody = {
+                    settings: {
+                        cursor: requestCursor,
+                        filter
+                    }
+                };
+
+                console.log(`Запрос ${requestIndex + 1}/${requestsNeeded}:`, JSON.stringify(requestBody, null, 2));
+
+                const cardsResponse = await makeWBRequest(`${WB_API_BASE.content}/content/v2/get/cards/list`, {
+                    method: 'POST',
+                    body: JSON.stringify(requestBody)
+                });
+
+                console.log(`Ответ ${requestIndex + 1}/${requestsNeeded}:`, cardsResponse);
+
+                if (!cardsResponse?.cards || cardsResponse.cards.length === 0) {
+                    console.log(`Запрос ${requestIndex + 1}: карточки не найдены, завершаем`);
+                    break;
+                }
+
+                // Добавляем полученные карточки к общему массиву
+                allCards = [...allCards, ...cardsResponse.cards];
+
+                // Сохраняем последний cursor для следующего запроса
+                finalCursor = cardsResponse.cursor;
+
+                // Обновляем cursor для следующего запроса
+                if (cardsResponse.cursor && cardsResponse.cards.length === currentLimit) {
+                    currentCursor = {
+                        limit: maxCardsPerRequest,
+                        updatedAt: cardsResponse.cursor.updatedAt,
+                        nmID: cardsResponse.cursor.nmID
+                    };
+                } else {
+                    // Если получили меньше карточек чем запрашивали - больше нет данных
+                    console.log(`Запрос ${requestIndex + 1}: получено ${cardsResponse.cards.length} из ${currentLimit}, данные закончились`);
+                    break;
+                }
+
+                // Задержка между запросами для соблюдения лимитов API (100 req/min)
+                if (requestIndex < requestsNeeded - 1) {
+                    // Увеличиваем задержку для больших запросов
+                    const delayMs = desiredPageSize > 500 ? 1000 : 700;
+                    await delay(delayMs);
+                }
+            }
+
+            // Сбрасываем прогресс
+            setLoadingProgress({ current: 0, total: 0 });
+
+            console.log(`Получено ${allCards.length} карточек за ${requestsNeeded} запросов`);
+
+            if (allCards.length === 0) {
+                return {
+                    products: [],
+                    cursor: finalCursor || null,
+                    hasMore: false,
+                    total: finalCursor?.total || 0
+                };
+            }
+
+            // Задержка перед получением дополнительных данных
             await delay(200);
 
-            // Получаем склады (кэшируем результат)
+            // Получаем склады (с кэшированием)
             let warehousesResponse = [];
-            if (!window.wbWarehousesCache) {
+            if (!window.wbWarehousesCache || Date.now() - (window.wbWarehousesCacheTime || 0) > 300000) { // Кэш на 5 минут
                 try {
                     warehousesResponse = await makeWBRequest(`${WB_API_BASE.marketplace}/api/v3/warehouses`);
-                    window.wbWarehousesCache = warehousesResponse; // Кэшируем
-                    console.log('Склады загружены и кэшированы:', warehousesResponse);
+                    window.wbWarehousesCache = warehousesResponse;
+                    window.wbWarehousesCacheTime = Date.now();
+                    console.log('Склады обновлены в кэше:', warehousesResponse);
                 } catch (warehouseError) {
                     console.warn('Ошибка получения складов:', warehouseError);
+                    warehousesResponse = window.wbWarehousesCache || [];
                 }
             } else {
                 warehousesResponse = window.wbWarehousesCache;
                 console.log('Используем кэшированные склады');
             }
 
-            // Собираем все SKU и nmID для массовых запросов
+            // Собираем данные для массовых запросов
             const allSkus = [];
             const allNmIds = [];
             const skuToCardMap = new Map();
 
-            cardsResponse.cards.forEach(card => {
+            allCards.forEach(card => {
                 allNmIds.push(card.nmID);
 
                 if (card.sizes && card.sizes.length > 0) {
@@ -791,12 +1121,12 @@ const MarketplaceManagementSystem = () => {
                 }
             });
 
-            console.log(`Собрано ${allSkus.length} SKU и ${allNmIds.length} nmID для массовых запросов`);
+            console.log(`Подготовлено для массовых запросов: ${allSkus.length} SKU, ${allNmIds.length} nmID`);
 
-            // Получаем остатки одним запросом (максимум 1000 SKU за запрос)
+            // Получение остатков массовыми запросами (максимум 1000 SKU за запрос)
             const stocksMap = new Map();
             if (warehousesResponse.length > 0 && allSkus.length > 0) {
-                const warehouse = warehousesResponse[0]; // Используем первый склад
+                const warehouse = warehousesResponse[0];
 
                 // Разбиваем SKU на батчи по 1000 (лимит API)
                 const skuBatches = [];
@@ -804,7 +1134,7 @@ const MarketplaceManagementSystem = () => {
                     skuBatches.push(allSkus.slice(i, i + 1000));
                 }
 
-                for (const skuBatch of skuBatches) {
+                for (const [batchIndex, skuBatch] of skuBatches.entries()) {
                     try {
                         const stocksResponse = await makeWBRequest(`${WB_API_BASE.marketplace}/api/v3/stocks/${warehouse.id}`, {
                             method: 'POST',
@@ -821,36 +1151,39 @@ const MarketplaceManagementSystem = () => {
                             });
                         }
 
-                        // Задержка между батчами остатков
-                        if (skuBatches.length > 1) {
-                            await delay(300);
+                        // Задержка между батчами остатков (300 req/min)
+                        if (batchIndex < skuBatches.length - 1) {
+                            await delay(250);
                         }
                     } catch (stockError) {
-                        console.warn(`Ошибка получения остатков для батча:`, stockError);
+                        console.warn(`Ошибка получения остатков для батча ${batchIndex + 1}:`, stockError);
                     }
                 }
             }
 
-            // Получаем цены одним запросом
+            // Получение цен массовым запросом
             await delay(200);
             let pricesMap = {};
             try {
                 pricesMap = await fetchWBPrices(allNmIds);
             } catch (priceError) {
-                console.warn('Не удалось получить цены через API, используем базовые цены из карточек:', priceError);
+                console.warn('Ошибка получения цен, используем базовые цены из карточек:', priceError);
             }
 
-            // Формируем итоговый массив товаров
-            const allProducts = cardsResponse.cards.map(card => {
+            // Формирование итогового массива товаров
+            let processedProducts = allCards.map(card => {
                 const totalStock = stocksMap.get(card.nmID) || 0;
                 const priceInfo = pricesMap[card.nmID] || {};
 
-                // Получаем цену из карточки, если не получили через API цен
+                // Базовая цена из карточки
                 const basePrice = card.sizes?.[0]?.price || 0;
 
-                // Получаем первую фотографию для миниатюры
+                // Получение URL первой фотографии
                 const firstPhoto = card.photos?.[0];
-                const photoUrl = firstPhoto ? (typeof firstPhoto === 'string' ? firstPhoto : firstPhoto.tm) : null;
+                const photoUrl = firstPhoto ? (
+                    typeof firstPhoto === 'string' ? firstPhoto :
+                        firstPhoto.big || firstPhoto.c516x688 || firstPhoto.tm || firstPhoto.square
+                ) : null;
 
                 return {
                     id: card.nmID,
@@ -869,21 +1202,39 @@ const MarketplaceManagementSystem = () => {
                     imtID: card.imtID,
                     createdAt: card.createdAt,
                     updatedAt: card.updatedAt,
-                    photo: photoUrl
+                    photo: photoUrl,
+                    needKiz: card.needKiz || false, // Новое поле для маркировки "Честный знак"
+                    hasPhoto: !!(card.photos && card.photos.length > 0)
                 };
             });
 
-            // Проверяем есть ли еще данные для загрузки
-            const hasMore = cardsResponse.cursor?.total > (cardsResponse.cursor?.updatedAt || 0) &&
-                cardsResponse.cards.length === requestBody.settings.cursor.limit;
+            // Применяем дополнительные фильтры после получения данных
+            if (activeFilters.showOnlyWithStock) {
+                processedProducts = processedProducts.filter(p => p.stock > 0);
+            }
 
-            console.log(`Обработано товаров: ${allProducts.length}, есть еще данные: ${hasMore}`);
+            if (activeFilters.showOnlyActive) {
+                processedProducts = processedProducts.filter(p => p.status === 'active');
+            }
 
-            return {
-                products: allProducts,
-                cursor: cardsResponse.cursor,
-                hasMore: hasMore
+            // Проверяем наличие дополнительных данных для загрузки
+            // Есть еще данные если последний запрос вернул полный лимит карточек
+            const lastRequestWasFull = allCards.length > 0 &&
+                (allCards.length % maxCardsPerRequest === 0) &&
+                finalCursor?.total > (finalCursor?.updatedAt || 0);
+
+            const hasMore = lastRequestWasFull && allCards.length < (finalCursor?.total || 0);
+
+            const resultData = {
+                products: processedProducts,
+                cursor: finalCursor,
+                hasMore: hasMore,
+                total: finalCursor?.total || processedProducts.length
             };
+
+            console.log(`Обработано товаров: ${processedProducts.length}, всего доступно: ${resultData.total}, есть еще: ${hasMore}`);
+
+            return resultData;
 
         } catch (error) {
             console.error('Ошибка загрузки товаров WB:', error);
@@ -891,10 +1242,10 @@ const MarketplaceManagementSystem = () => {
         }
     };
 
-    // Поиск товаров
-    const searchProducts = async (query) => {
+    // Поиск товаров с расширенными фильтрами
+    const searchProducts = async (query = '', customFilters = null) => {
         if (!apiKeys.wildberries) {
-            alert('Настройте API ключ Wildberries');
+            alert('Настройте API ключ Wildberries в разделе "Настройки"');
             return;
         }
 
@@ -904,44 +1255,54 @@ const MarketplaceManagementSystem = () => {
         setHasMoreProducts(true);
 
         try {
-            const result = await fetchWBProductsWithPagination(null, query);
+            // Обновляем фильтры поиска
+            const updatedFilters = {
+                ...searchFilters,
+                textSearch: query.trim(),
+                ...(customFilters || {})
+            };
+
+            setSearchFilters(updatedFilters);
+
+            // Передаем текущий pageSize в функцию загрузки
+            const result = await fetchWBProductsWithPagination(null, query, false, updatedFilters, pageSize);
             setProducts(result.products);
             setProductsCursor(result.cursor);
             setHasMoreProducts(result.hasMore);
-            setTotalProducts(result.cursor?.total || result.products.length);
+            setTotalProducts(result.total);
             setLastSync(new Date().toLocaleString('ru-RU'));
 
-            console.log(`Найдено товаров: ${result.products.length}`);
+            console.log(`Поиск завершен: найдено ${result.products.length} товаров из ${result.total}`);
+
+            if (result.products.length === 0 && query.trim()) {
+                console.log('Товары не найдены по запросу:', query);
+            }
+
         } catch (error) {
-            logApiError(error, 'Wildberries');
+            logApiError(error, 'Wildberries (поиск товаров)');
             handleWBError(error);
         } finally {
             setLoading(false);
         }
     };
 
-    // Загрузка дополнительных товаров
-    const loadMoreProducts = async () => {
-        if (!hasMoreProducts || isLoadingMore || !apiKeys.wildberries) return;
+    // Применение фильтров
+    const applyFilters = async () => {
+        await searchProducts(searchQuery, searchFilters);
+    };
 
-        setIsLoadingMore(true);
-        try {
-            const result = await fetchWBProductsWithPagination(productsCursor, searchQuery);
-            setProducts(prev => [...prev, ...result.products]);
-            setProductsCursor(result.cursor);
-            setHasMoreProducts(result.hasMore);
-
-            console.log(`Загружено еще товаров: ${result.products.length}`);
-        } catch (error) {
-            logApiError(error, 'Wildberries');
-            if (error.message.includes('429')) {
-                alert('⏱️ Превышен лимит запросов. Подождите 1-2 минуты перед повторной попыткой.');
-            } else {
-                console.error('Ошибка загрузки дополнительных товаров:', error);
-            }
-        } finally {
-            setIsLoadingMore(false);
-        }
+    // Сброс фильтров
+    const resetFilters = () => {
+        const defaultFilters = {
+            withPhoto: -1,
+            textSearch: '',
+            showOnlyWithStock: false,
+            showOnlyActive: false,
+            sortBy: 'updatedAt',
+            sortOrder: 'desc'
+        };
+        setSearchFilters(defaultFilters);
+        setSearchQuery('');
     };
 
     // Обработка ошибок WB API
@@ -1109,13 +1470,16 @@ const MarketplaceManagementSystem = () => {
         }
     };
 
-    // Очистка данных товаров
+// Очистка данных товаров и фильтров
     const clearProductsData = () => {
         setProducts([]);
         setProductsCursor(null);
         setHasMoreProducts(true);
         setTotalProducts(0);
         setSearchQuery('');
+        if (typeof resetFilters !== 'undefined') {
+            resetFilters();
+        }
     };
 
     const updateWBStock = async (sku, warehouseId, quantity) => {
@@ -1198,7 +1562,7 @@ const MarketplaceManagementSystem = () => {
                     try {
                         // Сбрасываем состояние при первой загрузке
                         if (!products.length) {
-                            const result = await fetchWBProductsWithPagination();
+                            const result = await fetchWBProductsWithPagination(null, '', false, null, pageSize);
                             products = [...products, ...result.products];
                             setProductsCursor(result.cursor);
                             setHasMoreProducts(result.hasMore);
@@ -1263,6 +1627,13 @@ const MarketplaceManagementSystem = () => {
     useEffect(() => {
         fetchMarketplaceData(selectedMarketplace);
     }, [selectedMarketplace]);
+    // Перезагружаем данные при изменении размера страницы
+    useEffect(() => {
+        // Пропускаем первый рендер
+        if (products.length > 0 || loading) {
+            return;
+        }
+    }, [pageSize]);
 
     const salesData = [
         { name: 'Пн', sales: 12, revenue: 284000 },
@@ -1768,12 +2139,51 @@ const MarketplaceManagementSystem = () => {
                                         </div>
                                     </div>
                                 )}
+                                {/* Панель массовых действий */}
+                                {selectedProductIds.size > 0 && (
+                                    <div className="bg-blue-50 border-y border-blue-200 px-4 py-3">
+                                        <div className="flex items-center justify-between">
+                                            <div className="flex items-center gap-4">
+                <span className="text-sm font-medium text-blue-700">
+                    Выбрано товаров: {selectedProductIds.size}
+                </span>
+                                                <button
+                                                    onClick={clearSelection}
+                                                    className="text-sm text-blue-600 hover:text-blue-800 underline"
+                                                >
+                                                    Снять выделение
+                                                </button>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <button
+                                                    onClick={openBulkEditModal}
+                                                    className="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 flex items-center gap-2"
+                                                >
+                                                    <Edit3 size={16} />
+                                                    Редактировать выбранные
+                                                </button>
+                                                <button
+                                                    className="px-4 py-2 bg-orange-600 text-white text-sm rounded-lg hover:bg-orange-700 flex items-center gap-2"
+                                                >
+                                                    <DollarSign size={16} />
+                                                    Изменить цены
+                                                </button>
+                                                <button
+                                                    className="px-4 py-2 bg-red-600 text-white text-sm rounded-lg hover:bg-red-700 flex items-center gap-2"
+                                                >
+                                                    <Trash2 size={16} />
+                                                    Удалить
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
 
                                 {/* Размеры товара */}
                                 {displayProduct.sizes && displayProduct.sizes.length > 0 && (
                                     <div className="bg-white border border-gray-200 rounded-lg p-4">
                                         <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
-                                            <Tag size={18} />
+                                            <Tag size={18}/>
                                             Размеры и SKU
                                         </h3>
                                         <div className="space-y-3">
@@ -1783,13 +2193,15 @@ const MarketplaceManagementSystem = () => {
                                                         {(size.techSize || isEditMode) && (
                                                             <div>
                                                                 <span className="text-gray-600">Тех. размер:</span>
-                                                                <div className="font-medium">{size.techSize || 'Не указан'}</div>
+                                                                <div
+                                                                    className="font-medium">{size.techSize || 'Не указан'}</div>
                                                             </div>
                                                         )}
                                                         {(size.wbSize || isEditMode) && (
                                                             <div>
                                                                 <span className="text-gray-600">Размер WB:</span>
-                                                                <div className="font-medium">{size.wbSize || 'Не указан'}</div>
+                                                                <div
+                                                                    className="font-medium">{size.wbSize || 'Не указан'}</div>
                                                             </div>
                                                         )}
                                                         <div>
@@ -1803,18 +2215,46 @@ const MarketplaceManagementSystem = () => {
                                                                     min="0"
                                                                 />
                                                             ) : (
-                                                                <div className="font-medium">₽{(size.price || 0).toLocaleString()}</div>
+                                                                <div
+                                                                    className="font-medium">₽{(size.price || 0).toLocaleString()}</div>
                                                             )}
                                                         </div>
                                                         {size.skus && size.skus.length > 0 && (
                                                             <div>
                                                                 <span className="text-gray-600">SKU:</span>
-                                                                <div className="font-mono text-xs">{size.skus.join(', ')}</div>
+                                                                <div
+                                                                    className="font-mono text-xs">{size.skus.join(', ')}</div>
                                                             </div>
                                                         )}
                                                     </div>
                                                 </div>
                                             ))}
+                                        </div>
+                                        <div className="flex items-center justify-between mb-4">
+                                            <h3 className="font-semibold text-gray-800 flex items-center gap-2">
+                                                <Tag size={18}/>
+                                                Размеры и SKU
+                                            </h3>
+                                            {isEditMode && (
+                                                <button
+                                                    onClick={() => {
+                                                        const newSize = {
+                                                            techSize: "0",
+                                                            wbSize: "",
+                                                            skus: [],
+                                                            price: editedProduct.sizes?.[0]?.price || 0
+                                                        };
+                                                        setEditedProduct({
+                                                            ...editedProduct,
+                                                            sizes: [...(editedProduct.sizes || []), newSize]
+                                                        });
+                                                    }}
+                                                    className="px-3 py-1 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700 flex items-center gap-1"
+                                                >
+                                                    <Plus size={16}/>
+                                                    Добавить размер
+                                                </button>
+                                            )}
                                         </div>
                                     </div>
                                 )}
@@ -1823,7 +2263,7 @@ const MarketplaceManagementSystem = () => {
                                 {displayProduct.dimensions && (
                                     <div className="bg-white border border-gray-200 rounded-lg p-4">
                                         <h3 className="font-semibold text-gray-800 mb-4 flex items-center gap-2">
-                                            <Box size={18} />
+                                            <Box size={18}/>
                                             Габариты товара
                                         </h3>
                                         <div className="grid grid-cols-3 gap-4">
@@ -1943,6 +2383,213 @@ const MarketplaceManagementSystem = () => {
                                 </button>
                             </div>
                         )}
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+    const renderBulkEditModal = () => {
+        if (!showBulkEditModal) return null;
+
+        const selectedProducts = products.filter(p => selectedProductIds.has(p.nmID));
+        const categories = [...new Set(selectedProducts.map(p => p.category))];
+
+        return (
+            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                <div className="bg-white rounded-xl max-w-4xl w-full max-h-[90vh] overflow-y-auto">
+                    {/* Заголовок */}
+                    <div className="sticky top-0 bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between z-10">
+                        <div>
+                            <h2 className="text-xl font-bold text-gray-800">
+                                Массовое редактирование товаров
+                            </h2>
+                            <p className="text-sm text-gray-500 mt-1">
+                                Выбрано {selectedProductIds.size} товаров
+                                {categories.length === 1 && ` • Категория: ${categories[0]}`}
+                            </p>
+                        </div>
+                        <button
+                            onClick={() => setShowBulkEditModal(false)}
+                            className="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg"
+                        >
+                            <X size={20} />
+                        </button>
+                    </div>
+
+                    {/* Содержимое */}
+                    <div className="p-6">
+                        {/* Предупреждение */}
+                        <div className="mb-6 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+                            <div className="flex items-start gap-3">
+                                <AlertTriangle className="text-yellow-600 mt-0.5" size={20} />
+                                <div>
+                                    <p className="text-sm font-medium text-yellow-800">
+                                        Внимание! Массовое редактирование
+                                    </p>
+                                    <p className="text-sm text-yellow-700 mt-1">
+                                        Изменения будут применены ко всем выбранным товарам.
+                                        Отметьте только те поля, которые хотите изменить.
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Общие поля */}
+                        <div className="space-y-6">
+                            <h3 className="text-lg font-semibold text-gray-800">Общие параметры</h3>
+
+                            {/* Бренд */}
+                            <div className="bg-gray-50 rounded-lg p-4">
+                                <label className="flex items-center gap-3 mb-3">
+                                    <input
+                                        type="checkbox"
+                                        checked={bulkEditData.brand.enabled}
+                                        onChange={(e) => setBulkEditData({
+                                            ...bulkEditData,
+                                            brand: { ...bulkEditData.brand, enabled: e.target.checked }
+                                        })}
+                                        className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                    />
+                                    <span className="font-medium text-gray-700">Изменить бренд</span>
+                                </label>
+                                {bulkEditData.brand.enabled && (
+                                    <input
+                                        type="text"
+                                        value={bulkEditData.brand.value}
+                                        onChange={(e) => setBulkEditData({
+                                            ...bulkEditData,
+                                            brand: { ...bulkEditData.brand, value: e.target.value }
+                                        })}
+                                        placeholder="Введите новый бренд"
+                                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                    />
+                                )}
+                            </div>
+
+                            {/* Габариты */}
+                            <div className="bg-gray-50 rounded-lg p-4">
+                                <label className="flex items-center gap-3 mb-3">
+                                    <input
+                                        type="checkbox"
+                                        checked={bulkEditData.dimensions.enabled}
+                                        onChange={(e) => setBulkEditData({
+                                            ...bulkEditData,
+                                            dimensions: { ...bulkEditData.dimensions, enabled: e.target.checked }
+                                        })}
+                                        className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                    />
+                                    <span className="font-medium text-gray-700">Изменить габариты</span>
+                                </label>
+                                {bulkEditData.dimensions.enabled && (
+                                    <div className="grid grid-cols-3 gap-4">
+                                        <div>
+                                            <label className="block text-sm text-gray-600 mb-1">Длина (см)</label>
+                                            <input
+                                                type="number"
+                                                value={bulkEditData.dimensions.value.length}
+                                                onChange={(e) => setBulkEditData({
+                                                    ...bulkEditData,
+                                                    dimensions: {
+                                                        ...bulkEditData.dimensions,
+                                                        value: { ...bulkEditData.dimensions.value, length: e.target.value }
+                                                    }
+                                                })}
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm text-gray-600 mb-1">Ширина (см)</label>
+                                            <input
+                                                type="number"
+                                                value={bulkEditData.dimensions.value.width}
+                                                onChange={(e) => setBulkEditData({
+                                                    ...bulkEditData,
+                                                    dimensions: {
+                                                        ...bulkEditData.dimensions,
+                                                        value: { ...bulkEditData.dimensions.value, width: e.target.value }
+                                                    }
+                                                })}
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-sm text-gray-600 mb-1">Высота (см)</label>
+                                            <input
+                                                type="number"
+                                                value={bulkEditData.dimensions.value.height}
+                                                onChange={(e) => setBulkEditData({
+                                                    ...bulkEditData,
+                                                    dimensions: {
+                                                        ...bulkEditData.dimensions,
+                                                        value: { ...bulkEditData.dimensions.value, height: e.target.value }
+                                                    }
+                                                })}
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                            />
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Характеристики (если все товары одной категории) */}
+                            {categories.length === 1 && (
+                                <div>
+                                    <h3 className="text-lg font-semibold text-gray-800 mb-4">
+                                        Характеристики категории "{categories[0]}"
+                                    </h3>
+                                    <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4">
+                                        <p className="text-sm text-blue-700">
+                                            Все выбранные товары относятся к одной категории.
+                                            Вы можете изменить общие характеристики.
+                                        </p>
+                                    </div>
+                                    {/* Здесь будет список характеристик категории */}
+                                    <div className="text-sm text-gray-500 text-center py-8">
+                                        Загрузка характеристик категории...
+                                    </div>
+                                </div>
+                            )}
+
+                            {categories.length > 1 && (
+                                <div className="bg-gray-50 border border-gray-200 rounded-lg p-4 text-center">
+                                    <Info className="mx-auto text-gray-400 mb-2" size={24} />
+                                    <p className="text-sm text-gray-600">
+                                        Выбраны товары из разных категорий ({categories.length}).
+                                    </p>
+                                    <p className="text-sm text-gray-500">
+                                        Можно изменить только общие параметры.
+                                    </p>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Кнопки действий */}
+                        <div className="flex justify-end gap-3 mt-8 pt-6 border-t border-gray-200">
+                            <button
+                                onClick={() => setShowBulkEditModal(false)}
+                                className="px-6 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300"
+                            >
+                                Отмена
+                            </button>
+                            <button
+                                onClick={applyBulkChanges}
+                                disabled={bulkSaving || (!bulkEditData.brand.enabled && !bulkEditData.dimensions.enabled)}
+                                className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                            >
+                                {bulkSaving ? (
+                                    <>
+                                        <Loader className="animate-spin" size={16} />
+                                        Применение изменений...
+                                    </>
+                                ) : (
+                                    <>
+                                        <Save size={16} />
+                                        Применить изменения
+                                    </>
+                                )}
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -2219,92 +2866,384 @@ const MarketplaceManagementSystem = () => {
 
             <div className="bg-white rounded-xl shadow-sm border border-gray-200">
                 <div className="p-4 border-b border-gray-200">
-                    <div className="flex flex-col lg:flex-row gap-4">
-                        <div className="flex-1 relative">
-                            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" size={20} />
-                            <input
-                                type="text"
-                                placeholder="Поиск по артикулу или номенклатуре WB..."
-                                value={searchQuery}
-                                onChange={(e) => setSearchQuery(e.target.value)}
-                                onKeyPress={(e) => {
-                                    if (e.key === 'Enter') {
-                                        searchProducts(searchQuery);
-                                    }
-                                }}
-                                className="w-full pl-10 pr-10 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900 placeholder-gray-500"
-                            />
-                            {searchQuery && (
-                                <button
-                                    onClick={() => {
-                                        clearProductsData();
-                                        fetchMarketplaceData(selectedMarketplace);
+                    <div className="flex flex-col gap-4">
+                        {/* Основная строка поиска */}
+                        <div className="flex flex-col lg:flex-row gap-4">
+                            <div className="flex-1 relative">
+                                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" size={20} />
+                                <input
+                                    type="text"
+                                    placeholder="Поиск по артикулу, названию или номенклатуре WB..."
+                                    value={searchQuery}
+                                    onChange={(e) => {
+                                        setSearchQuery(e.target.value);
+                                        if (typeof setSearchFilters !== 'undefined') {
+                                            setSearchFilters(prev => ({...prev, textSearch: e.target.value}));
+                                        }
                                     }}
-                                    className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600"
-                                >
-                                    <X size={16} />
-                                </button>
-                            )}
-                        </div>
-                        <div className="flex flex-wrap gap-2">
-                            <button
-                                onClick={() => searchProducts(searchQuery)}
-                                disabled={loading || !searchQuery.trim()}
-                                className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                                <Search size={18} />
-                                Найти
-                            </button>
-                            <select
-                                value={selectedMarketplace === 'wildberries' ? 'wildberries' : 'all'}
-                                onChange={(e) => setSelectedMarketplace(e.target.value)}
-                                className="px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
-                            >
-                                <option value="all">Все маркетплейсы</option>
-                                <option value="wildberries">Wildberries</option>
-                                <option value="ozon">Ozon</option>
-                                <option value="yandex">Яндекс.Маркет</option>
-                            </select>
-                            <button className="px-4 py-2 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 flex items-center gap-2 text-gray-700">
-                                <Filter size={18} />
-                                Фильтры
-                            </button>
-                        </div>
-                    </div>
+                                    onKeyPress={(e) => {
+                                        if (e.key === 'Enter') {
+                                            if (typeof searchProducts !== 'undefined') {
+                                                searchProducts(searchQuery);
+                                            } else {
+                                                // Fallback функция
+                                                const oldSearchProducts = async (query) => {
+                                                    if (!apiKeys.wildberries) {
+                                                        alert('Настройте API ключ Wildberries');
+                                                        return;
+                                                    }
 
-                    {/* Информация о результатах поиска */}
-                    {searchQuery && (
-                        <div className="mt-3 flex items-center justify-between text-sm">
-                            <div className="text-gray-600">
-                                {loading ? (
-                                    <span className="flex items-center gap-2">
-                    <Loader className="animate-spin" size={16} />
-                    Поиск товаров...
-                  </span>
-                                ) : (
-                                    <span>
-                    {products.length > 0 ? (
-                        <>Найдено товаров: <strong>{products.length}</strong> {totalProducts > products.length && `из ${totalProducts}`}</>
-                    ) : (
-                        'Товары не найдены'
-                    )}
-                  </span>
+                                                    setLoading(true);
+                                                    setProducts([]);
+                                                    setProductsCursor(null);
+                                                    setHasMoreProducts(true);
+
+                                                    try {
+                                                        const result = await fetchWBProductsWithPagination(null, query);
+                                                        setProducts(result.products);
+                                                        setProductsCursor(result.cursor);
+                                                        setHasMoreProducts(result.hasMore);
+                                                        setTotalProducts(result.total || result.products.length);
+                                                        setLastSync(new Date().toLocaleString('ru-RU'));
+                                                    } catch (error) {
+                                                        logApiError(error, 'Wildberries');
+                                                        handleWBError(error);
+                                                    } finally {
+                                                        setLoading(false);
+                                                    }
+                                                };
+                                                oldSearchProducts(searchQuery);
+                                            }
+                                        }
+                                    }}
+                                    className="w-full pl-10 pr-10 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900 placeholder-gray-500"
+                                />
+                                {searchQuery && (
+                                    <button
+                                        onClick={() => {
+                                            setSearchQuery('');
+                                            if (typeof resetFilters !== 'undefined') {
+                                                resetFilters();
+                                            }
+                                            fetchMarketplaceData(selectedMarketplace);
+                                        }}
+                                        className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                                    >
+                                        <X size={16} />
+                                    </button>
                                 )}
                             </div>
-                            {products.length > 0 && (
-                                <div className="text-gray-500 text-xs">
-                                    Поиск по: "{searchQuery}"
-                                </div>
-                            )}
+                            <div className="flex flex-wrap gap-2">
+                                <button
+                                    onClick={() => {
+                                        if (typeof searchProducts !== 'undefined') {
+                                            searchProducts(searchQuery);
+                                        } else {
+                                            alert('Функция поиска не найдена. Убедитесь, что все новые функции добавлены.');
+                                        }
+                                    }}
+                                    disabled={loading}
+                                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    <Search size={18} />
+                                    Найти
+                                </button>
+                                <select
+                                    value={selectedMarketplace === 'wildberries' ? 'wildberries' : 'all'}
+                                    onChange={(e) => setSelectedMarketplace(e.target.value)}
+                                    className="px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
+                                >
+                                    <option value="all">Все маркетплейсы</option>
+                                    <option value="wildberries">Wildberries</option>
+                                    <option value="ozon">Ozon</option>
+                                    <option value="yandex">Яндекс.Маркет</option>
+                                </select>
+                            </div>
                         </div>
-                    )}
 
-                    {/* Подсказки по поиску */}
-                    {!searchQuery && (
-                        <div className="mt-3 text-xs text-gray-500">
-                            💡 <strong>Поиск:</strong> Введите артикул продавца (например: "ABC123") или номенклатуру WB (например: "12345678")
+                        {/* Индикатор прогресса для больших запросов */}
+                        {loading && loadingProgress.total > 1 && (
+                            <div className="p-4 bg-blue-50 border-b border-blue-200">
+                                <div className="mb-2 flex items-center justify-between">
+                                    <div className="flex items-center gap-3">
+                                        <Loader className="animate-spin text-blue-600" size={20} />
+                                        <div>
+                                            <p className="text-blue-700 font-medium">
+                                                Загрузка большого количества товаров...
+                                            </p>
+                                            <p className="text-xs text-blue-600">
+                                                Выполнено запросов: {loadingProgress.current} из {loadingProgress.total}
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <span className="text-sm text-blue-600">
+                {Math.round((loadingProgress.current / loadingProgress.total) * 100)}%
+            </span>
+                                </div>
+                                <div className="w-full bg-blue-200 rounded-full h-2">
+                                    <div
+                                        className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                                        style={{ width: `${(loadingProgress.current / loadingProgress.total) * 100}%` }}
+                                    />
+                                </div>
+                                <p className="text-xs text-blue-600 mt-2">
+                                    Соблюдаем лимиты API Wildberries (100 запросов/мин). Пожалуйста, подождите...
+                                </p>
+                            </div>
+                        )}
+
+                        {/* Расширенные фильтры */}
+                        <details className="group">
+                            <summary className="flex items-center gap-2 cursor-pointer text-sm font-medium text-gray-700 hover:text-gray-900">
+                                <Filter size={18} />
+                                Расширенные фильтры и настройки
+                                <ChevronDown className="group-open:rotate-180 transition-transform" size={16} />
+                            </summary>
+                            <div className="mt-4 p-4 bg-gray-50 rounded-lg space-y-4">
+                                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
+                                    {/* Размер страницы */}
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-1">
+                                            Товаров на страницу
+                                        </label>
+                                        <div className="flex gap-2">
+                                            <select
+                                                value={showCustomPageSize ? 'custom' : pageSize}
+                                                onChange={(e) => {
+                                                    if (e.target.value === 'custom') {
+                                                        setShowCustomPageSize(true);
+                                                    } else {
+                                                        const newSize = parseInt(e.target.value);
+                                                        setPageSize(newSize);
+                                                        setShowCustomPageSize(false);
+                                                        setCustomPageSize('');
+                                                        // Применяем фильтр сразу после изменения размера
+                                                        searchProducts(searchQuery, searchFilters);
+                                                    }
+                                                }}
+                                                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
+                                            >
+                                                <option value={10}>10 товаров</option>
+                                                <option value={30}>30 товаров</option>
+                                                <option value={50}>50 товаров</option>
+                                                <option value={100}>100 товаров</option>
+                                                <option value={200}>200 товаров</option>
+                                                <option value={500}>500 товаров</option>
+                                                <option value={1000}>1000 товаров (макс. рекомендовано)</option>
+                                                <option value="custom">Свой размер...</option>
+                                            </select>
+
+                                            {showCustomPageSize && (
+                                                <div className="flex gap-2">
+                                                    <input
+                                                        type="number"
+                                                        value={customPageSize}
+                                                        onChange={(e) => setCustomPageSize(e.target.value)}
+                                                        placeholder="Кол-во"
+                                                        min="1"
+                                                        max="10000"
+                                                        className="w-24 px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                    />
+                                                    <button
+                                                        onClick={() => {
+                                                            const size = parseInt(customPageSize);
+                                                            if (size > 0) {
+                                                                if (size > WB_API_LIMITS.maxTotalProducts) {
+                                                                    if (confirm(`⚠️ Внимание! Вы запрашиваете ${size} товаров.\n\nЭто может занять много времени из-за лимитов API:\n• Максимум 100 товаров за запрос\n• Лимит 100 запросов в минуту\n\nДля загрузки ${size} товаров потребуется примерно ${Math.ceil(size / 100)} запросов и ${Math.ceil(size / 100 / 100 * 60)} секунд.\n\nПродолжить?`)) {
+                                                                        setPageSize(size);
+                                                                        setShowCustomPageSize(false);
+                                                                        setCustomPageSize('');
+                                                                        // Применяем фильтр сразу после изменения размера
+                                                                        searchProducts(searchQuery, searchFilters);
+                                                                    }
+                                                                } else {
+                                                                    setPageSize(size);
+                                                                    setShowCustomPageSize(false);
+                                                                    setCustomPageSize('');
+                                                                    // Применяем фильтр сразу после изменения размера
+                                                                    searchProducts(searchQuery, searchFilters);
+                                                                }
+                                                            }
+                                                        }}
+                                                        className="px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                                                    >
+                                                        OK
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        {/* Информация о лимитах */}
+                                        <div className="mt-2 text-xs text-gray-500">
+                                            <p>Лимиты API: 100 товаров/запрос, 100 запросов/мин</p>
+                                            {pageSize > 100 && (
+                                                <p className="text-yellow-600">
+                                                    ⚠️ Для {pageSize} товаров нужно {Math.ceil(pageSize / 100)} запросов
+                                                    (~{Math.ceil(pageSize / 100 * 0.7)} сек.)
+                                                </p>
+                                            )}
+                                        </div>
+                                    </div>
+
+                                    {/* Фильтр по фото */}
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-1">Фото
+                                            товара</label>
+                                        <select
+                                            value={typeof searchFilters !== 'undefined' ? searchFilters.withPhoto : -1}
+                                            onChange={(e) => {
+                                                if (typeof setSearchFilters !== 'undefined') {
+                                                    setSearchFilters(prev => ({...prev, withPhoto: parseInt(e.target.value)}));
+                                                }
+                                            }}
+                                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
+                                        >
+                                            <option value={-1}>Все товары</option>
+                                            <option value={1}>Только с фото</option>
+                                            <option value={0}>Только без фото</option>
+                                        </select>
+                                    </div>
+
+                                    {/* Фильтр по остаткам */}
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-1">Остатки товара</label>
+                                        <select className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900">
+                                            <option value="all">Все товары</option>
+                                            <option value="in_stock">Есть в наличии (&gt; 0)</option>
+                                            <option value="low_stock">Заканчивается (&lt; 10)</option>
+                                            <option value="out_of_stock">Нет в наличии (= 0)</option>
+                                            <option value="good_stock">Хорошие остатки (&gt; 50)</option>
+                                        </select>
+                                    </div>
+
+                                    {/* Фильтр по статусу */}
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-1">Статус товара</label>
+                                        <select className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900">
+                                            <option value="all">Все статусы</option>
+                                            <option value="active">Активные</option>
+                                            <option value="out_of_stock">Нет в наличии</option>
+                                            <option value="unknown">Неизвестно</option>
+                                        </select>
+                                    </div>
+
+                                    {/* Сортировка */}
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-1">Сортировка</label>
+                                        <select
+                                            value={typeof searchFilters !== 'undefined' ? `${searchFilters.sortBy}-${searchFilters.sortOrder}` : 'updatedAt-desc'}
+                                            onChange={(e) => {
+                                                const [sortBy, sortOrder] = e.target.value.split('-');
+                                                if (typeof setSearchFilters !== 'undefined') {
+                                                    setSearchFilters(prev => ({...prev, sortBy, sortOrder}));
+                                                }
+                                            }}
+                                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
+                                        >
+                                            <option value="updatedAt-desc">Обновлено (новые)</option>
+                                            <option value="updatedAt-asc">Обновлено (старые)</option>
+                                            <option value="createdAt-desc">Создано (новые)</option>
+                                            <option value="createdAt-asc">Создано (старые)</option>
+                                            <option value="nmID-desc">ID товара (убыв.)</option>
+                                            <option value="nmID-asc">ID товара (возр.)</option>
+                                        </select>
+                                    </div>
+                                </div>
+
+                                {/* Дополнительные чекбоксы */}
+                                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                                    <label className="flex items-center">
+                                        <input
+                                            type="checkbox"
+                                            checked={typeof searchFilters !== 'undefined' ? searchFilters.showOnlyWithStock : false}
+                                            onChange={(e) => {
+                                                if (typeof setSearchFilters !== 'undefined') {
+                                                    setSearchFilters(prev => ({...prev, showOnlyWithStock: e.target.checked}));
+                                                }
+                                            }}
+                                            className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                        />
+                                        <span className="ml-2 text-sm text-gray-600">Только с остатками</span>
+                                    </label>
+                                    <label className="flex items-center">
+                                        <input
+                                            type="checkbox"
+                                            checked={typeof searchFilters !== 'undefined' ? searchFilters.showOnlyActive : false}
+                                            onChange={(e) => {
+                                                if (typeof setSearchFilters !== 'undefined') {
+                                                    setSearchFilters(prev => ({...prev, showOnlyActive: e.target.checked}));
+                                                }
+                                            }}
+                                            className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                        />
+                                        <span className="ml-2 text-sm text-gray-600">Только активные</span>
+                                    </label>
+                                    <label className="flex items-center">
+                                        <input
+                                            type="checkbox"
+                                            className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                        />
+                                        <span className="ml-2 text-sm text-gray-600">Со скидками</span>
+                                    </label>
+                                    <label className="flex items-center">
+                                        <input
+                                            type="checkbox"
+                                            className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                        />
+                                        <span className="ml-2 text-sm text-gray-600">Требуют КиЗ</span>
+                                    </label>
+                                </div>
+
+                                <div className="flex flex-wrap gap-2">
+                                    <button
+                                        onClick={() => {
+                                            if (typeof applyFilters !== 'undefined') {
+                                                applyFilters();
+                                            } else {
+                                                alert('Функция применения фильтров не найдена. Добавьте новые функции.');
+                                            }
+                                        }}
+                                        disabled={loading}
+                                        className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-2 disabled:opacity-50 text-sm"
+                                    >
+                                        <Filter size={16} />
+                                        Применить фильтры
+                                    </button>
+                                    <button
+                                        onClick={() => {
+                                            if (typeof resetFilters !== 'undefined') {
+                                                resetFilters();
+                                            }
+                                            fetchMarketplaceData(selectedMarketplace);
+                                        }}
+                                        className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 text-sm"
+                                    >
+                                        Сбросить все
+                                    </button>
+                                    <button
+                                        onClick={() => {
+                                            clearProductsData();
+                                            fetchMarketplaceData(selectedMarketplace);
+                                        }}
+                                        className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm"
+                                    >
+                                        <RefreshCw size={16} className="mr-1" />
+                                        Перезагрузить
+                                    </button>
+                                </div>
+                            </div>
+                        </details>
+
+                        {/* Информация о текущих настройках */}
+                        <div className="text-xs text-gray-500 bg-blue-50 border border-blue-200 rounded-lg p-3">
+                            <div className="flex flex-wrap items-center gap-4">
+                                <span><strong>Размер страницы:</strong> {typeof pageSize !== 'undefined' ? pageSize : 50} товаров</span>
+                                <span><strong>Загружено:</strong> {products.length} товаров</span>
+                                {totalProducts > 0 && <span><strong>Всего доступно:</strong> {totalProducts.toLocaleString()}</span>}
+                                {searchQuery && <span><strong>Поиск:</strong> "{searchQuery}"</span>}
+                            </div>
                         </div>
-                    )}
+                    </div>
                 </div>
 
                 {/* Индикатор загрузки */}
@@ -2325,6 +3264,20 @@ const MarketplaceManagementSystem = () => {
                     <table className="min-w-full divide-y divide-gray-200">
                         <thead className="bg-gray-50">
                         <tr>
+                            <th className="px-4 py-3 w-12">
+                                <input
+                                    type="checkbox"
+                                    checked={products.length > 0 && selectedProductIds.size === products.length}
+                                    onChange={() => {
+                                        if (selectedProductIds.size === products.length) {
+                                            clearSelection();
+                                        } else {
+                                            selectAllProducts();
+                                        }
+                                    }}
+                                    className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                />
+                            </th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-80">Товар</th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-32">Артикул</th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-32">Штрихкод</th>
@@ -2339,7 +3292,7 @@ const MarketplaceManagementSystem = () => {
                         {loading ? (
                             <tr>
                                 <td colSpan="8" className="px-6 py-12 text-center">
-                                    <Loader className="animate-spin mx-auto text-gray-400" size={32} />
+                                    <Loader className="animate-spin mx-auto text-gray-400" size={32}/>
                                     <p className="mt-2 text-gray-500">Загрузка товаров...</p>
                                 </td>
                             </tr>
@@ -2369,9 +3322,18 @@ const MarketplaceManagementSystem = () => {
                         ) : (
                             products.map((product) => (
                                 <tr key={`${product.id}-${product.nmID}`} className="hover:bg-gray-50">
+                                    <td className="px-4 py-4 w-12">
+                                        <input
+                                            type="checkbox"
+                                            checked={selectedProductIds.has(product.nmID)}
+                                            onChange={() => toggleProductSelection(product.nmID)}
+                                            className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                                        />
+                                    </td>
                                     <td className="px-4 py-4 whitespace-nowrap">
                                         <div className="flex items-center max-w-xs">
-                                            <div className="h-10 w-10 bg-gray-200 rounded-lg mr-3 flex items-center justify-center flex-shrink-0 overflow-hidden">
+                                            <div
+                                                className="h-10 w-10 bg-gray-200 rounded-lg mr-3 flex items-center justify-center flex-shrink-0 overflow-hidden">
                                                 {product.photo ? (
                                                     <img
                                                         src={`${product.photo}`}
@@ -2383,12 +3345,14 @@ const MarketplaceManagementSystem = () => {
                                                         }}
                                                     />
                                                 ) : null}
-                                                <div className={`${product.photo ? 'hidden' : 'flex'} items-center justify-center w-full h-full`}>
-                                                    <Package className="text-gray-400" size={20} />
+                                                <div
+                                                    className={`${product.photo ? 'hidden' : 'flex'} items-center justify-center w-full h-full`}>
+                                                    <Package className="text-gray-400" size={20}/>
                                                 </div>
                                             </div>
                                             <div className="min-w-0 flex-1">
-                                                <div className="text-sm font-medium text-gray-900 truncate" title={product.name}>
+                                                <div className="text-sm font-medium text-gray-900 truncate"
+                                                     title={product.name}>
                                                     {product.name}
                                                 </div>
                                                 <div className="text-xs text-gray-500 truncate">{product.brand}</div>
@@ -2401,7 +3365,8 @@ const MarketplaceManagementSystem = () => {
                                         </div>
                                     </td>
                                     <td className="px-4 py-4 whitespace-nowrap">
-                                        <div className="text-sm text-gray-500 font-mono truncate" title={product.barcode}>
+                                        <div className="text-sm text-gray-500 font-mono truncate"
+                                             title={product.barcode}>
                                             {product.barcode}
                                         </div>
                                     </td>
@@ -2410,50 +3375,52 @@ const MarketplaceManagementSystem = () => {
                                             {product.discountedPrice && product.discountedPrice !== product.price ? (
                                                 <>
                                                     <div className="flex items-center gap-1">
-                                                        <span className="text-sm font-semibold text-green-600">
-                                                            ₽{product.discountedPrice.toLocaleString()}
-                                                        </span>
+                                                    <span className="text-sm font-semibold text-green-600">
+                                                        ₽{product.discountedPrice.toLocaleString()}
+                                                    </span>
                                                         {product.discount > 0 && (
-                                                            <span className="px-1 py-0.5 bg-red-100 text-red-800 text-xs font-medium rounded">
-                                                                -{product.discount}%
-                                                            </span>
+                                                            <span
+                                                                className="px-1 py-0.5 bg-red-100 text-red-800 text-xs font-medium rounded">
+                                                            -{product.discount}%
+                                                        </span>
                                                         )}
                                                     </div>
                                                     <span className="text-xs text-gray-500 line-through">
-                                                        ₽{product.price.toLocaleString()}
-                                                    </span>
+                                                    ₽{product.price.toLocaleString()}
+                                                </span>
                                                 </>
                                             ) : (
                                                 <span className="text-sm font-medium">
-                                                    ₽{product.price.toLocaleString()}
-                                                </span>
+                                                ₽{product.price.toLocaleString()}
+                                            </span>
                                             )}
                                         </div>
                                     </td>
                                     <td className="px-4 py-4 whitespace-nowrap">
-                      <span className={`text-sm font-medium ${
-                          product.stock > 10 ? 'text-green-600' :
-                              product.stock > 0 ? 'text-yellow-600' :
-                                  'text-red-600'
-                      }`}>
-                        {product.stock}
-                      </span>
+                                    <span className={`text-sm font-medium ${
+                                        product.stock > 10 ? 'text-green-600' :
+                                            product.stock > 0 ? 'text-yellow-600' :
+                                                'text-red-600'
+                                    }`}>
+                                        {product.stock}
+                                    </span>
                                     </td>
                                     <td className="px-4 py-4 whitespace-nowrap">
                                         <div className="text-sm text-gray-500 truncate">{product.marketplace}</div>
                                     </td>
                                     <td className="px-4 py-4 whitespace-nowrap">
-                      <span className={`px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${
-                          product.status === 'active'
-                              ? 'bg-green-100 text-green-800'
-                              : product.status === 'out_of_stock'
-                                  ? 'bg-red-100 text-red-800'
-                                  : 'bg-gray-100 text-gray-800'
-                      }`}>
-                        {product.status === 'active' ? 'Активен' :
-                            product.status === 'out_of_stock' ? 'Нет в наличии' :
-                                'Неизвестно'}
-                      </span>
+                                    <span
+                                        className={`px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${
+                                            product.status === 'active'
+                                                ? 'bg-green-100 text-green-800'
+                                                : product.status === 'out_of_stock'
+                                                    ? 'bg-red-100 text-red-800'
+                                                    : 'bg-gray-100 text-gray-800'
+                                        }`}>
+                                        {product.status === 'active' ? 'Активен' :
+                                            product.status === 'out_of_stock' ? 'Нет в наличии' :
+                                                'Неизвестно'}
+                                    </span>
                                     </td>
                                     <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-500">
                                         <div className="flex gap-1">
@@ -2462,7 +3429,7 @@ const MarketplaceManagementSystem = () => {
                                                 title="Просмотр"
                                                 onClick={() => openProductCard(product)}
                                             >
-                                                <Eye size={16} />
+                                                <Eye size={16}/>
                                             </button>
                                             <button
                                                 className="text-gray-600 hover:text-gray-800 p-1 rounded hover:bg-gray-50"
@@ -2472,10 +3439,12 @@ const MarketplaceManagementSystem = () => {
                                                     setTimeout(() => startEditProduct(), 500);
                                                 }}
                                             >
-                                                <Edit size={16} />
+                                                <Edit size={16}/>
                                             </button>
-                                            <button className="text-red-600 hover:text-red-800 p-1 rounded hover:bg-red-50" title="Удалить">
-                                                <Trash2 size={16} />
+                                            <button
+                                                className="text-red-600 hover:text-red-800 p-1 rounded hover:bg-red-50"
+                                                title="Удалить">
+                                                <Trash2 size={16}/>
                                             </button>
                                         </div>
                                     </td>
@@ -2486,8 +3455,8 @@ const MarketplaceManagementSystem = () => {
                     </table>
                 </div>
 
-                {/* Пагинация - кнопка "Загрузить еще" */}
-                {products.length > 0 && hasMoreProducts && !searchQuery && (
+                {/* Пагинация с информацией о размере страницы */}
+                {products.length > 0 && hasMoreProducts && (
                     <div className="p-6 border-t border-gray-200 text-center">
                         <button
                             onClick={loadMoreProducts}
@@ -2502,30 +3471,75 @@ const MarketplaceManagementSystem = () => {
                             ) : (
                                 <>
                                     <ChevronDown size={18} />
-                                    Загрузить еще товары
+                                    Загрузить еще товары ({typeof pageSize !== 'undefined' ? pageSize : 50} шт.)
                                 </>
                             )}
                         </button>
-                        <p className="text-xs text-gray-500 mt-2">
-                            Загружено: {products.length} товаров
-                            {totalProducts > 0 && ` из ${totalProducts}`}
-                        </p>
+                        <div className="mt-3 space-y-1">
+                            <p className="text-sm text-gray-600">
+                                Загружено: <strong>{products.length}</strong> товаров
+                                {totalProducts > 0 && ` из ${totalProducts.toLocaleString()}`}
+                            </p>
+                            <p className="text-xs text-gray-500">
+                                Размер страницы: {typeof pageSize !== 'undefined' ? pageSize : 50} товаров •
+                                {hasMoreProducts ? ` Еще доступно для загрузки` : ' Все товары загружены'}
+                            </p>
+                        </div>
                     </div>
                 )}
 
                 {/* Информация о завершении загрузки */}
-                {products.length > 0 && !hasMoreProducts && !searchQuery && (
+                {products.length > 0 && !hasMoreProducts && (
                     <div className="p-4 border-t border-gray-200 text-center">
                         <div className="flex items-center justify-center gap-2 text-gray-500">
                             <CheckCircle size={18} className="text-green-500" />
-                            <span>Все товары загружены ({products.length} шт.)</span>
+                            <span>
+                            Все товары загружены
+                            ({products.length.toLocaleString()} {totalProducts > 0 ? `из ${totalProducts.toLocaleString()}` : ''} шт.)
+                        </span>
                         </div>
+                        <p className="text-xs text-gray-400 mt-1">
+                            Размер страницы: {typeof pageSize !== 'undefined' ? pageSize : 50} товаров • Используйте фильтры для уточнения результатов
+                        </p>
+                    </div>
+                )}
+
+                {/* Информация для результатов поиска с фильтрами */}
+                {products.length > 0 && (searchQuery || (typeof searchFilters !== 'undefined' && Object.values(searchFilters).some(v => v !== searchFilters.textSearch && v !== '' && v !== -1 && v !== false && v !== 'updatedAt' && v !== 'desc'))) && (
+                    <div className="p-4 border-t border-gray-200 text-center">
+                        <div className="flex items-center justify-center gap-2 text-blue-600">
+                            <Search size={18} />
+                            <span>
+                            Результаты поиска/фильтрации: {products.length} товаров
+                                {totalProducts > products.length && ` из ${totalProducts}`}
+                        </span>
+                        </div>
+                        {hasMoreProducts && (
+                            <button
+                                onClick={loadMoreProducts}
+                                disabled={isLoadingMore}
+                                className="mt-3 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-2 mx-auto disabled:opacity-50"
+                            >
+                                {isLoadingMore ? (
+                                    <>
+                                        <Loader className="animate-spin" size={16} />
+                                        Загрузка...
+                                    </>
+                                ) : (
+                                    <>
+                                        <ChevronDown size={16} />
+                                        Загрузить еще
+                                    </>
+                                )}
+                            </button>
+                        )}
                     </div>
                 )}
             </div>
 
-            {/* Модальное окно карточки товара */}
+            {/* Модальные окна */}
             {renderProductModal()}
+            {renderBulkEditModal()}
         </div>
     );
 
@@ -2534,15 +3548,17 @@ const MarketplaceManagementSystem = () => {
             <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
                 <h2 className="text-2xl font-bold text-gray-800">Управление заказами</h2>
                 <div className="flex flex-wrap gap-3">
-                    <select className="px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900">
+                    <select
+                        className="px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900">
                         <option value="all">Все статусы</option>
                         <option value="pending">Ожидает обработки</option>
                         <option value="processing">В обработке</option>
                         <option value="shipped">Отправлен</option>
                         <option value="delivered">Доставлен</option>
                     </select>
-                    <button className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-2">
-                        <Download size={18} />
+                    <button
+                        className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-2">
+                        <Download size={18}/>
                         Экспорт заказов
                     </button>
                 </div>
@@ -2754,18 +3770,25 @@ const MarketplaceManagementSystem = () => {
                                 <div className="text-xs text-green-600 space-y-1">
                                     <p><strong>Доступные функции:</strong></p>
                                     <ul className="ml-3 space-y-1 list-disc list-inside">
-                                        <li>Автоматическая загрузка карточек товаров</li>
+                                        <li>Автоматическая загрузка карточек товаров с настраиваемым размером страницы
+                                            (10-1000 товаров)
+                                        </li>
+                                        <li>Расширенный поиск и фильтрация (по фото, остаткам, статусу)</li>
                                         <li>Получение новых заказов (сборочных заданий)</li>
-                                        <li>Синхронизация остатков товаров на складах</li>
-                                        <li>Получение и обновление цен товаров (если доступно)</li>
-                                        <li>Редактирование карточек товаров</li>
-                                        <li>Управление характеристиками товаров</li>
+                                        <li>Синхронизация остатков товаров на складах с кэшированием</li>
+                                        <li>Получение и обновление цен товаров (улучшенный алгоритм)</li>
+                                        <li>Редактирование карточек товаров с расширенной валидацией</li>
+                                        <li>Управление характеристиками товаров (обязательные/популярные)</li>
                                         <li>Мониторинг скидок и акций</li>
                                         <li>Мониторинг статусов заказов</li>
-                                        <li>Тестирование подключения к API</li>
+                                        <li>Проверка маркировки "Честный знак" (новое поле needKiz)</li>
+                                        <li>Тестирование подключения к API с детальной диагностикой</li>
                                     </ul>
                                     <div className="mt-2 pt-2 border-t border-green-300">
-                                        <p><strong>Лимиты API:</strong> Контент 100 req/min • Маркетплейс 300 req/min • Цены 100 req/min</p>
+                                        <p><strong>Лимиты API:</strong> Контент 100 req/min • Маркетплейс 300 req/min •
+                                            Цены 100 req/min</p>
+                                        <p><strong>Максимальные размеры:</strong> Карточки до 3000 nmID/запрос • SKU до
+                                            1000/запрос</p>
                                         <p><strong>Срок действия токена:</strong> 180 дней с момента создания</p>
                                     </div>
                                 </div>
@@ -2778,7 +3801,7 @@ const MarketplaceManagementSystem = () => {
                     <div className="flex items-center justify-between mb-4">
                         <div className="flex items-center gap-3">
                             <div className="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center">
-                                <Store className="text-blue-600" size={24} />
+                                <Store className="text-blue-600" size={24}/>
                             </div>
                             <div>
                                 <h3 className="text-lg font-semibold text-gray-800">Ozon</h3>
@@ -2786,7 +3809,8 @@ const MarketplaceManagementSystem = () => {
                             </div>
                         </div>
                         <div className="flex items-center gap-2">
-                            <div className={`w-2 h-2 ${apiKeys.ozon.apiKey ? 'bg-yellow-500' : 'bg-gray-400'} rounded-full`}></div>
+                            <div
+                                className={`w-2 h-2 ${apiKeys.ozon.apiKey ? 'bg-yellow-500' : 'bg-gray-400'} rounded-full`}></div>
                             <span className={`text-sm ${apiKeys.ozon.apiKey ? 'text-yellow-600' : 'text-gray-600'}`}>
                 {apiKeys.ozon.apiKey ? 'В разработке' : 'Не настроено'}
               </span>
@@ -3406,6 +4430,62 @@ const MarketplaceManagementSystem = () => {
             </div>
         </div>
     );
+};
+
+const startEditProduct = () => {
+    if (productDetails) {
+        // Создаем глубокую копию и преобразуем характеристики в правильный формат
+        const editableProduct = JSON.parse(JSON.stringify(productDetails));
+
+        // Убеждаемся, что есть хотя бы один размер
+        if (!editableProduct.sizes || editableProduct.sizes.length === 0) {
+            editableProduct.sizes = [{
+                techSize: "0",
+                wbSize: "",
+                skus: editableProduct.barcode ? [editableProduct.barcode] : [],
+                price: editableProduct.price || 0
+            }];
+        }
+
+        // Убеждаемся, что все размеры имеют techSize
+        editableProduct.sizes = editableProduct.sizes.map(size => ({
+            ...size,
+            techSize: size.techSize || "0",
+            skus: Array.isArray(size.skus) ? size.skus : []
+        }));
+
+        // Убеждаемся, что все характеристики имеют значения в виде массивов
+        if (editableProduct.characteristics) {
+            editableProduct.characteristics = editableProduct.characteristics.map(char => ({
+                ...char,
+                value: Array.isArray(char.value) ? char.value : (char.value ? [char.value] : []),
+                popular: char.popular || false
+            }));
+        }
+
+        setEditedProduct(editableProduct);
+        setIsEditMode(true);
+    }
+};
+
+const loadMoreProducts = async () => {
+    if (!hasMoreProducts || isLoadingMore) return;
+
+    setIsLoadingMore(true);
+    try {
+        const result = await fetchWBProductsWithPagination(productsCursor, searchQuery, true, searchFilters, pageSize);
+
+        if (result.products.length > 0) {
+            setProducts(prevProducts => [...prevProducts, ...result.products]);
+            setProductsCursor(result.cursor);
+            setHasMoreProducts(result.hasMore);
+        }
+    } catch (error) {
+        console.error('Ошибка загрузки дополнительных товаров:', error);
+        logApiError(error, 'Wildberries');
+    } finally {
+        setIsLoadingMore(false);
+    }
 };
 
 export default MarketplaceManagementSystem;
