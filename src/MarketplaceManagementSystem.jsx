@@ -34,8 +34,10 @@ const MarketplaceManagementSystem = () => {
         textSearch: '',
         showOnlyWithStock: false,
         showOnlyActive: false,
-        sortBy: 'updatedAt', // updatedAt, createdAt, nmID
-        sortOrder: 'desc' // desc, asc
+        sortBy: 'updatedAt', // updatedAt, createdAt, nmID, price, stock
+        sortOrder: 'desc', // desc, asc
+        brand: 'all', // Новый фильтр
+        category: 'all' // Новый фильтр
     });
 
     const [products, setProducts] = useState([]);
@@ -57,6 +59,9 @@ const MarketplaceManagementSystem = () => {
     const [editedProduct, setEditedProduct] = useState(null);
     const [categoryCharacteristics, setCategoryCharacteristics] = useState([]);
     const [savingProduct, setSavingProduct] = useState(false);
+
+    const [filteredProducts, setFilteredProducts] = useState([]); // Отфильтрованные товары для отображения
+    const [allProducts, setAllProducts] = useState([]); // Все загруженные товары
 
     const logApiError = (error, marketplace) => {
         const errorEntry = {
@@ -764,18 +769,19 @@ const MarketplaceManagementSystem = () => {
         });
     };
 
-// Выбрать все товары на странице
+    // Выбрать все товары на странице
     const selectAllProducts = () => {
-        const allIds = new Set(products.map(p => p.nmID));
+        const displayProducts = filteredProducts.length > 0 ? filteredProducts : products;
+        const allIds = new Set(displayProducts.map(p => p.nmID));
         setSelectedProductIds(allIds);
     };
 
-// Снять выделение со всех товаров
+    // Снять выделение со всех товаров
     const clearSelection = () => {
         setSelectedProductIds(new Set());
     };
 
-// Открыть модальное окно массового редактирования
+    // Открыть модальное окно массового редактирования
     const openBulkEditModal = async () => {
         if (selectedProductIds.size === 0) return;
 
@@ -794,91 +800,215 @@ const MarketplaceManagementSystem = () => {
         setShowBulkEditModal(true);
     };
 
-// Применить массовые изменения
+    // Применить массовые изменения
     const applyBulkChanges = async () => {
         setBulkSaving(true);
+        setLoadingProgress({ current: 0, total: selectedProductIds.size });
+
         try {
             const selectedProducts = products.filter(p => selectedProductIds.has(p.nmID));
             const updatePromises = [];
+            let processedCount = 0;
 
+            // Для каждого товара нужно загрузить полные данные
             for (const product of selectedProducts) {
-                const updatePayload = {
-                    nmID: product.nmID,
-                    vendorCode: product.sku // или product.vendorCode, если это правильный артикул продавца
-                };
-                // Применяем только включенные изменения
-                if (bulkEditData.brand.enabled) {
-                    updatePayload.brand = bulkEditData.brand.value;
-                }
+                try {
+                    // Загружаем полные данные товара
+                    const fullProductDetails = await fetchProductDetails(product);
 
-                if (bulkEditData.dimensions.enabled) {
-                    updatePayload.dimensions = {
-                        length: parseInt(bulkEditData.dimensions.value.length) || 0,
-                        width: parseInt(bulkEditData.dimensions.value.width) || 0,
-                        height: parseInt(bulkEditData.dimensions.value.height) || 0,
-                        isValid: true
+                    // Обновляем прогресс
+                    processedCount++;
+                    setLoadingProgress({ current: processedCount, total: selectedProductIds.size });
+
+                    // Создаем полный payload с ВСЕМИ данными товара
+                    const updatePayload = {
+                        nmID: parseInt(fullProductDetails.nmID),
+                        vendorCode: fullProductDetails.vendorCode || product.sku,
+
+                        // Применяем изменение бренда или оставляем существующий
+                        brand: bulkEditData.brand.enabled
+                            ? bulkEditData.brand.value
+                            : (fullProductDetails.brand || ""),
+
+                        // Обязательные поля из существующих данных
+                        title: fullProductDetails.title || product.name || "",
+                        description: fullProductDetails.description || "",
+
+                        // Применяем изменение габаритов или оставляем существующие
+                        dimensions: bulkEditData.dimensions.enabled
+                            ? {
+                                length: parseInt(bulkEditData.dimensions.value.length) || 0,
+                                width: parseInt(bulkEditData.dimensions.value.width) || 0,
+                                height: parseInt(bulkEditData.dimensions.value.height) || 0,
+                                isValid: true
+                            }
+                            : (fullProductDetails.dimensions || {
+                                length: 0,
+                                width: 0,
+                                height: 0,
+                                isValid: true
+                            }),
+
+                        // ВАЖНО: Сохраняем ВСЕ существующие характеристики
+                        characteristics: (() => {
+                            // Начинаем с существующих характеристик
+                            let resultCharacteristics = [];
+
+                            // Если есть характеристики в полных данных, используем их
+                            if (fullProductDetails.characteristics && fullProductDetails.characteristics.length > 0) {
+                                resultCharacteristics = fullProductDetails.characteristics
+                                    .filter(char => {
+                                        // Фильтруем только валидные характеристики
+                                        const charIdNumber = parseInt(char.id);
+                                        return !isNaN(charIdNumber) && charIdNumber > 0 && char.value && (
+                                            Array.isArray(char.value)
+                                                ? char.value.length > 0 && char.value.some(v => v && v.toString().trim() !== '')
+                                                : char.value.toString().trim() !== ''
+                                        );
+                                    })
+                                    .map(char => {
+                                        // Проверяем, есть ли изменения для этой характеристики в массовом редактировании
+                                        const bulkChar = bulkEditData.characteristics.find(bc =>
+                                            bc.id === char.id && bc.enabled
+                                        );
+
+                                        if (bulkChar) {
+                                            // Применяем изменение из массового редактирования
+                                            return {
+                                                id: parseInt(char.id),
+                                                value: bulkChar.value ? [bulkChar.value] : char.value
+                                            };
+                                        } else {
+                                            // Оставляем существующее значение
+                                            let valueArray = Array.isArray(char.value) ? char.value : [char.value];
+                                            valueArray = valueArray
+                                                .filter(v => v && v.toString().trim() !== '')
+                                                .map(v => v.toString().trim());
+
+                                            return {
+                                                id: parseInt(char.id),
+                                                value: valueArray
+                                            };
+                                        }
+                                    });
+                            }
+
+                            // Добавляем новые характеристики из массового редактирования
+                            bulkEditData.characteristics
+                                .filter(char => char.enabled && char.value)
+                                .forEach(bulkChar => {
+                                    // Проверяем, нет ли уже такой характеристики
+                                    const exists = resultCharacteristics.find(rc => rc.id === parseInt(bulkChar.id));
+                                    if (!exists) {
+                                        resultCharacteristics.push({
+                                            id: parseInt(bulkChar.id),
+                                            value: [bulkChar.value]
+                                        });
+                                    }
+                                });
+
+                            return resultCharacteristics;
+                        })(),
+
+                        // ВАЖНО: Сохраняем ВСЕ размеры товара
+                        sizes: (() => {
+                            const existingSizes = fullProductDetails.sizes || product.sizes || [];
+
+                            if (existingSizes.length === 0) {
+                                // Если нет размеров, создаем дефолтный
+                                return [{
+                                    techSize: "0",
+                                    wbSize: "",
+                                    skus: fullProductDetails.barcode ? [fullProductDetails.barcode] :
+                                        product.barcode ? [product.barcode] : [],
+                                    price: bulkEditData.price.enabled ? bulkEditData.price.value :
+                                        (fullProductDetails.price || product.price || 0)
+                                }];
+                            }
+
+                            // Обновляем существующие размеры
+                            return existingSizes.map(size => ({
+                                chrtID: size.chrtID, // Важно для существующих размеров
+                                techSize: size.techSize || "0",
+                                wbSize: size.wbSize || "",
+                                skus: Array.isArray(size.skus) ? size.skus : [],
+                                // Обновляем цену если включено массовое изменение цены
+                                price: bulkEditData.price.enabled ? bulkEditData.price.value : (size.price || 0)
+                            }));
+                        })()
                     };
-                }
 
-                // Добавляем характеристики если включены
-                if (bulkEditData.characteristics.length > 0) {
-                    updatePayload.characteristics = bulkEditData.characteristics
-                        .filter(char => char.enabled && char.value)
-                        .map(char => ({
-                            id: parseInt(char.id),
-                            value: [char.value]
-                        }));
+                    updatePromises.push(updatePayload);
+
+                    // Небольшая задержка между загрузками деталей товаров
+                    if (processedCount < selectedProducts.length) {
+                        await delay(200);
+                    }
+
+                } catch (error) {
+                    console.error(`Ошибка подготовки данных для товара ${product.nmID}:`, error);
+                    // Продолжаем с остальными товарами
                 }
-                if (product.sizes && product.sizes.length > 0) {
-                    updatePayload.sizes = product.sizes.map(s => ({
-                        chrtID: s.chrtID, // Обязательно для существующих размеров
-                        techSize: s.techSize,
-                        wbSize: s.wbSize,
-                        skus: s.skus,
-                        // Если вы массово редактируете цену через этот же эндпоинт,
-                        // то цена размера должна быть обновлена здесь.
-                        // Если цена редактируется через prices API, то оставляем текущую s.price.
-                        price: bulkEditData.price.enabled ? bulkEditData.price.value : s.price
-                    }));
-                } else {
-                    // Если по какой-то причине у товара нет размеров (что маловероятно для существующих)
-                    // или product.sizes не был загружен, создаем минимальный размер, как в одиночном редактировании
-                    console.warn(`Товар ${product.nmID} не имеет размеров в данных. Создаем дефолтный размер.`);
-                    updatePayload.sizes = [{
-                        techSize: "0", // или какой-то дефолтный techSize, если известен
-                        wbSize: "",
-                        skus: product.barcode ? [product.barcode] : [],
-                        price: bulkEditData.price.enabled ? bulkEditData.price.value : product.price // Используем общую цену товара
-                    }];
-                }
-                updatePromises.push(updatePayload);
+            }
+
+            // Сбрасываем прогресс перед отправкой
+            setLoadingProgress({ current: 0, total: 0 });
+
+            if (updatePromises.length === 0) {
+                alert('❌ Не удалось подготовить данные для обновления');
+                return;
             }
 
             // Отправляем батчами по 100 товаров (лимит API)
             const batchSize = 100;
             let successCount = 0;
+            let errorCount = 0;
 
             for (let i = 0; i < updatePromises.length; i += batchSize) {
                 const batch = updatePromises.slice(i, i + batchSize);
 
                 try {
-                    await makeWBRequest(`${WB_API_BASE.content}/content/v2/cards/update`, {
+                    const response = await makeWBRequest(`${WB_API_BASE.content}/content/v2/cards/update`, {
                         method: 'POST',
                         body: JSON.stringify(batch)
                     });
-                    successCount += batch.length;
 
-                    // Задержка между батчами
+                    if (response.error === false) {
+                        successCount += batch.length;
+                    } else {
+                        errorCount += batch.length;
+                        console.error('Ошибка обновления батча:', response);
+                    }
+
+                    // Задержка между батчами (соблюдаем лимиты API)
                     if (i + batchSize < updatePromises.length) {
                         await delay(1000);
                     }
                 } catch (error) {
                     console.error('Ошибка обновления батча:', error);
                     logApiError(error, 'Wildberries (массовое обновление)');
+                    errorCount += batch.length;
                 }
             }
 
-            alert(`✅ Успешно обновлено ${successCount} из ${selectedProductIds.size} товаров`);
+            // Результаты
+            let message = `✅ Операция завершена\n\n`;
+            message += `Успешно обновлено: ${successCount} товаров\n`;
+            if (errorCount > 0) {
+                message += `Ошибки при обновлении: ${errorCount} товаров\n`;
+            }
+            message += `\nИзменения:\n`;
+            if (bulkEditData.brand.enabled) {
+                message += `• Бренд изменен на: ${bulkEditData.brand.value}\n`;
+            }
+            if (bulkEditData.dimensions.enabled) {
+                message += `• Габариты изменены на: ${bulkEditData.dimensions.value.length}×${bulkEditData.dimensions.value.width}×${bulkEditData.dimensions.value.height} см\n`;
+            }
+            if (bulkEditData.price.enabled) {
+                message += `• Цена изменена на: ₽${bulkEditData.price.value}\n`;
+            }
+
+            alert(message);
 
             // Перезагружаем данные
             await fetchMarketplaceData(selectedMarketplace);
@@ -896,6 +1026,7 @@ const MarketplaceManagementSystem = () => {
             alert('❌ Произошла ошибка при массовом обновлении товаров');
         } finally {
             setBulkSaving(false);
+            setLoadingProgress({ current: 0, total: 0 });
         }
     };
 
@@ -1279,6 +1410,7 @@ const MarketplaceManagementSystem = () => {
 
         setLoading(true);
         setProducts([]);
+        setFilteredProducts([]);
         setProductsCursor(null);
         setHasMoreProducts(true);
 
@@ -1295,6 +1427,8 @@ const MarketplaceManagementSystem = () => {
             // Передаем текущий pageSize в функцию загрузки
             const result = await fetchWBProductsWithPagination(null, query, false, updatedFilters, pageSize);
             setProducts(result.products);
+            setFilteredProducts(result.products);
+            setFilteredProducts(result.products);
             setProductsCursor(result.cursor);
             setHasMoreProducts(result.hasMore);
             setTotalProducts(result.total);
@@ -1314,9 +1448,78 @@ const MarketplaceManagementSystem = () => {
         }
     };
 
-    // Применение фильтров
+// Применение фильтров
     const applyFilters = async () => {
-        await searchProducts(searchQuery, searchFilters);
+        // Если товары уже загружены, фильтруем локально
+        if (products.length > 0 && !searchQuery) {
+            let filteredProducts = [...products];
+
+            // Фильтр по фото
+            if (searchFilters.withPhoto !== -1) {
+                filteredProducts = filteredProducts.filter(p =>
+                    searchFilters.withPhoto === 1 ? p.hasPhoto : !p.hasPhoto
+                );
+            }
+
+            // Фильтр по остаткам
+            if (searchFilters.showOnlyWithStock) {
+                filteredProducts = filteredProducts.filter(p => p.stock > 0);
+            }
+
+            // Фильтр по статусу
+            if (searchFilters.showOnlyActive) {
+                filteredProducts = filteredProducts.filter(p => p.status === 'active');
+            }
+
+            // Фильтр по бренду
+            if (searchFilters.brand && searchFilters.brand !== 'all') {
+                filteredProducts = filteredProducts.filter(p =>
+                    p.brand === searchFilters.brand
+                );
+            }
+
+            // Фильтр по категории
+            if (searchFilters.category && searchFilters.category !== 'all') {
+                filteredProducts = filteredProducts.filter(p =>
+                    p.category === searchFilters.category
+                );
+            }
+
+            // Применяем сортировку
+            filteredProducts.sort((a, b) => {
+                let compareValue = 0;
+
+                switch (searchFilters.sortBy) {
+                    case 'updatedAt':
+                        compareValue = new Date(b.updatedAt) - new Date(a.updatedAt);
+                        break;
+                    case 'createdAt':
+                        compareValue = new Date(b.createdAt) - new Date(a.createdAt);
+                        break;
+                    case 'nmID':
+                        compareValue = b.nmID - a.nmID;
+                        break;
+                    case 'price':
+                        compareValue = b.price - a.price;
+                        break;
+                    case 'stock':
+                        compareValue = b.stock - a.stock;
+                        break;
+                }
+
+                return searchFilters.sortOrder === 'desc' ? compareValue : -compareValue;
+            });
+
+            // Обновляем отображаемые товары
+            setFilteredProducts(filteredProducts);
+
+            // Показываем уведомление
+            console.log(`Фильтрация применена: ${filteredProducts.length} из ${products.length} товаров`);
+
+        } else {
+            // Если товаров нет или есть поисковый запрос, загружаем с сервера
+            await searchProducts(searchQuery, searchFilters);
+        }
     };
 
     // Сброс фильтров
@@ -1327,10 +1530,13 @@ const MarketplaceManagementSystem = () => {
             showOnlyWithStock: false,
             showOnlyActive: false,
             sortBy: 'updatedAt',
-            sortOrder: 'desc'
+            sortOrder: 'desc',
+            brand: 'all',
+            category: 'all'
         };
         setSearchFilters(defaultFilters);
         setSearchQuery('');
+        setFilteredProducts(products); // Сбрасываем фильтрацию
     };
 
     // Обработка ошибок WB API
@@ -1643,6 +1849,7 @@ const MarketplaceManagementSystem = () => {
             }
 
             setProducts(products);
+            setFilteredProducts(products);
             setOrders(orders);
         } catch (error) {
             console.error('Ошибка при загрузке данных:', error);
@@ -2038,73 +2245,46 @@ const MarketplaceManagementSystem = () => {
                                 {displayProduct.characteristics && displayProduct.characteristics.length > 0 && (
                                     <div className="bg-white border border-gray-200 rounded-lg p-4">
                                         <h3 className="font-semibold text-gray-800 mb-4 flex items-center justify-between">
-                                            <span className="flex items-center gap-2">
-                                                <Info size={18} />
-                                                Характеристики товара
-                                                {isEditMode && (
-                                                    <span className="text-sm font-normal text-gray-500 ml-2">
-                                                        (заполните необходимые поля)
-                                                    </span>
-                                                )}
-                                            </span>
-                                            {isEditMode && categoryCharacteristics.length > displayProduct.characteristics.length && (
-                                                <button
-                                                    onClick={() => {
-                                                        // Добавляем недостающие характеристики из категории
-                                                        const currentIds = new Set(editedProduct.characteristics.map(c => c.id));
-                                                        const newChars = categoryCharacteristics
-                                                            .filter(cat => !currentIds.has(cat.id))
-                                                            .map(cat => ({
-                                                                id: cat.id,
-                                                                name: cat.name,
-                                                                required: cat.required || false,
-                                                                unitName: cat.unitName,
-                                                                value: [],
-                                                                popular: cat.popular || false
-                                                            }));
-
-                                                        setEditedProduct({
-                                                            ...editedProduct,
-                                                            characteristics: [...editedProduct.characteristics, ...newChars]
-                                                        });
-                                                    }}
-                                                    className="text-sm text-blue-600 hover:text-blue-800"
-                                                >
-                                                    + Добавить все характеристики категории
-                                                </button>
-                                            )}
+            <span className="flex items-center gap-2">
+                <Info size={18} />
+                Характеристики товара
+                {isEditMode && (
+                    <span className="text-sm font-normal text-gray-500 ml-2">
+                        (заполните необходимые поля)
+                    </span>
+                )}
+            </span>
                                         </h3>
 
-                                        {isEditMode && (
-                                            <div className="mb-4 p-3 bg-gray-50 rounded-lg">
-                                                <div className="text-sm text-gray-600">
-                                                    <span className="font-medium">Статус заполнения:</span>
-                                                    <div className="flex items-center gap-4 mt-1">
-                                                        <span className="flex items-center gap-1">
-                                                            <span className="w-3 h-3 bg-green-500 rounded-full"></span>
-                                                            <span>Заполнено: {displayProduct.characteristics.filter(char =>
-                                                                Array.isArray(char.value) ? char.value.length > 0 && char.value[0] !== '' : char.value
-                                                            ).length}</span>
-                                                        </span>
-                                                        <span className="flex items-center gap-1">
-                                                            <span className="w-3 h-3 bg-yellow-500 rounded-full"></span>
-                                                            <span>Не заполнено: {displayProduct.characteristics.filter(char =>
-                                                                !char.value || (Array.isArray(char.value) && (char.value.length === 0 || char.value[0] === '')) || (!Array.isArray(char.value) && !char.value)
-                                                            ).length}</span>
-                                                        </span>
-                                                        <span className="flex items-center gap-1">
-                                                            <span className="w-3 h-3 bg-red-500 rounded-full"></span>
-                                                            <span>Обязательных: {displayProduct.characteristics.filter(char => char.required).length}</span>
-                                                        </span>
+                                        {/* Предупреждения о валидации */}
+                                        {isEditMode && editedProduct && (
+                                            <div className="mb-4 space-y-2">
+                                                {/* Проверка бренда для категории */}
+                                                {editedProduct.brand === 'Не указан' && editedProduct.subjectName && (
+                                                    <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-lg flex items-start gap-2">
+                                                        <AlertTriangle className="text-yellow-600 mt-0.5" size={16} />
+                                                        <div className="text-sm text-yellow-700">
+                                                            <strong>Внимание:</strong> Бренд «{editedProduct.brand}» не представлен в категории «{editedProduct.subjectName}», выберите другой
+                                                        </div>
                                                     </div>
-                                                </div>
+                                                )}
+
+                                                {/* Другие предупреждения */}
+                                                {editedProduct.characteristics?.some(char => char.required && (!char.value || char.value.length === 0)) && (
+                                                    <div className="p-3 bg-red-50 border border-red-200 rounded-lg flex items-start gap-2">
+                                                        <AlertCircle className="text-red-600 mt-0.5" size={16} />
+                                                        <div className="text-sm text-red-700">
+                                                            Заполните все обязательные характеристики (отмечены *)
+                                                        </div>
+                                                    </div>
+                                                )}
                                             </div>
                                         )}
 
+                                        {/* Характеристики с подсказками */}
                                         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                                             {displayProduct.characteristics
                                                 .sort((a, b) => {
-                                                    // Сортировка: обязательные -> популярные -> остальные
                                                     if (a.required && !b.required) return -1;
                                                     if (!a.required && b.required) return 1;
                                                     if (a.popular && !b.popular) return -1;
@@ -2116,14 +2296,20 @@ const MarketplaceManagementSystem = () => {
                                                         ? char.value.length > 0 && char.value[0] !== ''
                                                         : !!char.value;
 
+                                                    // Проверка валидации для конкретной характеристики
+                                                    const hasValidationError = isEditMode && char.name === 'Бренд' &&
+                                                        editedProduct?.brand === 'Не указан' && editedProduct?.subjectName;
+
                                                     return (
-                                                        <div key={char.id || index} className={`border rounded-lg p-3 ${
+                                                        <div key={char.id || index} className={`border rounded-lg p-3 relative ${
                                                             isEditMode
-                                                                ? isFilled
-                                                                    ? 'border-green-300 bg-green-50'
-                                                                    : char.required
-                                                                        ? 'border-red-300 bg-red-50'
-                                                                        : 'border-gray-200 bg-yellow-50'
+                                                                ? hasValidationError
+                                                                    ? 'border-yellow-300 bg-yellow-50'
+                                                                    : isFilled
+                                                                        ? 'border-green-300 bg-green-50'
+                                                                        : char.required
+                                                                            ? 'border-red-300 bg-red-50'
+                                                                            : 'border-gray-200 bg-yellow-50'
                                                                 : 'border-gray-100'
                                                         }`}>
                                                             <div className="font-medium text-gray-800 mb-1 flex items-center gap-1">
@@ -2132,22 +2318,29 @@ const MarketplaceManagementSystem = () => {
                                                                 {char.popular && !char.required && (
                                                                     <Star size={12} className="text-yellow-500 fill-current" title="Популярная характеристика" />
                                                                 )}
-                                                                {isEditMode && (
-                                                                    <span className={`ml-auto text-xs ${
-                                                                        isFilled ? 'text-green-600' : 'text-gray-400'
-                                                                    }`}>
-                                                                        {isFilled ? '✓' : '○'}
-                                                                    </span>
+                                                                {isEditMode && hasValidationError && (
+                                                                    <AlertTriangle size={14} className="text-yellow-600 ml-1"
+                                                                                   title={`Бренд не подходит для категории ${editedProduct.subjectName}`} />
                                                                 )}
                                                             </div>
+
                                                             {isEditMode ? (
-                                                                <input
-                                                                    type="text"
-                                                                    value={Array.isArray(char.value) ? char.value[0] || '' : char.value || ''}
-                                                                    onChange={(e) => updateCharacteristic(char.id, e.target.value)}
-                                                                    className="w-full px-2 py-1 border border-gray-300 rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-                                                                    placeholder={char.required ? 'Обязательное поле' : char.popular ? 'Рекомендуется заполнить' : 'Необязательное поле'}
-                                                                />
+                                                                <div>
+                                                                    <input
+                                                                        type="text"
+                                                                        value={Array.isArray(char.value) ? char.value[0] || '' : char.value || ''}
+                                                                        onChange={(e) => updateCharacteristic(char.id, e.target.value)}
+                                                                        className={`w-full px-2 py-1 border rounded text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 ${
+                                                                            hasValidationError ? 'border-yellow-400' : 'border-gray-300'
+                                                                        }`}
+                                                                        placeholder={char.required ? 'Обязательное поле' : char.popular ? 'Рекомендуется заполнить' : 'Необязательное поле'}
+                                                                    />
+                                                                    {hasValidationError && (
+                                                                        <p className="text-xs text-yellow-600 mt-1">
+                                                                            Выберите другой бренд для категории
+                                                                        </p>
+                                                                    )}
+                                                                </div>
                                                             ) : (
                                                                 <div className="text-sm text-gray-600">
                                                                     {Array.isArray(char.value)
@@ -2156,6 +2349,7 @@ const MarketplaceManagementSystem = () => {
                                                                     }
                                                                 </div>
                                                             )}
+
                                                             {char.unitName && (
                                                                 <div className="text-xs text-gray-500 mt-1">
                                                                     Единица: {char.unitName}
@@ -2420,7 +2614,7 @@ const MarketplaceManagementSystem = () => {
     const renderBulkEditModal = () => {
         if (!showBulkEditModal) return null;
 
-        const selectedProducts = products.filter(p => selectedProductIds.has(p.nmID));
+        const selectedProducts = displayProducts.filter(p => selectedProductIds.has(p.nmID));
         const categories = [...new Set(selectedProducts.map(p => p.category))];
 
         return (
@@ -2591,6 +2785,25 @@ const MarketplaceManagementSystem = () => {
                                 </div>
                             )}
                         </div>
+                        {/* Прогресс загрузки */}
+                        {bulkSaving && loadingProgress.total > 0 && (
+                                <div className="mb-4 p-4 bg-blue-50 border border-blue-200 rounded-lg">
+                                    <div className="flex items-center justify-between mb-2">
+                <span className="text-sm font-medium text-blue-700">
+                    Загрузка данных товаров...
+                </span>
+                                        <span className="text-sm text-blue-600">
+                    {loadingProgress.current} из {loadingProgress.total}
+                </span>
+                                    </div>
+                                    <div className="w-full bg-blue-200 rounded-full h-2">
+                                        <div
+                                            className="bg-blue-600 h-2 rounded-full transition-all duration-300"
+                                            style={{ width: `${(loadingProgress.current / loadingProgress.total) * 100}%` }}
+                                        />
+                                    </div>
+                                </div>
+                        )}
 
                         {/* Кнопки действий */}
                         <div className="flex justify-end gap-3 mt-8 pt-6 border-t border-gray-200">
@@ -2695,25 +2908,19 @@ const MarketplaceManagementSystem = () => {
             )}
 
             {/* Информация о количестве загруженных товаров */}
-            {products.length > 0 && (
+            {displayProducts.length > 0 && (
                 <div className="bg-green-50 border border-green-200 rounded-lg p-3">
                     <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
                             <CheckCircle className="text-green-600" size={16} />
                             <span className="text-sm text-green-700">
-                Загружено товаров: <strong>{products.length}</strong>
-                                {totalProducts > products.length && ` из ${totalProducts}`}
-                                {searchQuery && ` (поиск: "${searchQuery}")`}
-              </span>
+                    Показано товаров: <strong>{displayProducts.length}</strong>
+                                {filteredProducts.length > 0 && filteredProducts.length < products.length &&
+                                    ` (отфильтровано из ${products.length})`}
+                                {totalProducts > products.length && ` • Всего доступно: ${totalProducts}`}
+                                {searchQuery && ` • Поиск: "${searchQuery}"`}
+                </span>
                         </div>
-                        {hasMoreProducts && !searchQuery && (
-                            <button
-                                onClick={() => setActiveTab('products')}
-                                className="text-xs text-green-600 hover:text-green-800 underline"
-                            >
-                                Загрузить еще
-                            </button>
-                        )}
                     </div>
                 </div>
             )}
@@ -2842,7 +3049,9 @@ const MarketplaceManagementSystem = () => {
         </div>
     );
 
-    const renderProducts = () => (
+    const renderProducts = () => {
+    // Определяем, какие товары отображать
+    return (
         <div className="space-y-6">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <h2 className="text-2xl font-bold text-gray-800">Управление товарами</h2>
@@ -3037,7 +3246,7 @@ const MarketplaceManagementSystem = () => {
                                         <div className="flex gap-2">
                                             <select
                                                 value={showCustomPageSize ? 'custom' : pageSize}
-                                                onChange={(e) => {
+                                                onChange={async (e) => {
                                                     if (e.target.value === 'custom') {
                                                         setShowCustomPageSize(true);
                                                     } else {
@@ -3045,8 +3254,7 @@ const MarketplaceManagementSystem = () => {
                                                         setPageSize(newSize);
                                                         setShowCustomPageSize(false);
                                                         setCustomPageSize('');
-                                                        // Применяем фильтр сразу после изменения размера
-                                                        searchProducts(searchQuery, searchFilters);
+                                                        // НЕ вызываем searchProducts здесь
                                                     }
                                                 }}
                                                 className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
@@ -3075,22 +3283,10 @@ const MarketplaceManagementSystem = () => {
                                                     <button
                                                         onClick={() => {
                                                             const size = parseInt(customPageSize);
-                                                            if (size > 0) {
-                                                                if (size > WB_API_LIMITS.maxTotalProducts) {
-                                                                    if (confirm(`⚠️ Внимание! Вы запрашиваете ${size} товаров.\n\nЭто может занять много времени из-за лимитов API:\n• Максимум 100 товаров за запрос\n• Лимит 100 запросов в минуту\n\nДля загрузки ${size} товаров потребуется примерно ${Math.ceil(size / 100)} запросов и ${Math.ceil(size / 100 / 100 * 60)} секунд.\n\nПродолжить?`)) {
-                                                                        setPageSize(size);
-                                                                        setShowCustomPageSize(false);
-                                                                        setCustomPageSize('');
-                                                                        // Применяем фильтр сразу после изменения размера
-                                                                        searchProducts(searchQuery, searchFilters);
-                                                                    }
-                                                                } else {
-                                                                    setPageSize(size);
-                                                                    setShowCustomPageSize(false);
-                                                                    setCustomPageSize('');
-                                                                    // Применяем фильтр сразу после изменения размера
-                                                                    searchProducts(searchQuery, searchFilters);
-                                                                }
+                                                            if (size > 0 && size <= 10000) {
+                                                                setPageSize(size);
+                                                                setShowCustomPageSize(false);
+                                                                // НЕ вызываем searchProducts здесь
                                                             }
                                                         }}
                                                         className="px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
@@ -3098,17 +3294,6 @@ const MarketplaceManagementSystem = () => {
                                                         OK
                                                     </button>
                                                 </div>
-                                            )}
-                                        </div>
-
-                                        {/* Информация о лимитах */}
-                                        <div className="mt-2 text-xs text-gray-500">
-                                            <p>Лимиты API: 100 товаров/запрос, 100 запросов/мин</p>
-                                            {pageSize > 100 && (
-                                                <p className="text-yellow-600">
-                                                    ⚠️ Для {pageSize} товаров нужно {Math.ceil(pageSize / 100)} запросов
-                                                    (~{Math.ceil(pageSize / 100 * 0.7)} сек.)
-                                                </p>
                                             )}
                                         </div>
                                     </div>
@@ -3141,6 +3326,36 @@ const MarketplaceManagementSystem = () => {
                                             <option value="low_stock">Заканчивается (&lt; 10)</option>
                                             <option value="out_of_stock">Нет в наличии (= 0)</option>
                                             <option value="good_stock">Хорошие остатки (&gt; 50)</option>
+                                        </select>
+                                    </div>
+
+                                    {/* Фильтр по бренду */}
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-1">Бренд</label>
+                                        <select
+                                            value={searchFilters.brand}
+                                            onChange={(e) => setSearchFilters(prev => ({...prev, brand: e.target.value}))}
+                                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
+                                        >
+                                            <option value="all">Все бренды</option>
+                                            {[...new Set(products.map(p => p.brand))].sort().map(brand => (
+                                                <option key={brand} value={brand}>{brand}</option>
+                                            ))}
+                                        </select>
+                                    </div>
+
+                                    {/* Фильтр по категории */}
+                                    <div>
+                                        <label className="block text-sm font-medium text-gray-700 mb-1">Категория</label>
+                                        <select
+                                            value={searchFilters.category}
+                                            onChange={(e) => setSearchFilters(prev => ({...prev, category: e.target.value}))}
+                                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
+                                        >
+                                            <option value="all">Все категории</option>
+                                            {[...new Set(products.map(p => p.category))].sort().map(category => (
+                                                <option key={category} value={category}>{category}</option>
+                                            ))}
                                         </select>
                                     </div>
 
@@ -3295,9 +3510,9 @@ const MarketplaceManagementSystem = () => {
                             <th className="px-4 py-3 w-12">
                                 <input
                                     type="checkbox"
-                                    checked={products.length > 0 && selectedProductIds.size === products.length}
+                                    checked={displayProducts.length > 0 && selectedProductIds.size === displayProducts.length}
                                     onChange={() => {
-                                        if (selectedProductIds.size === products.length) {
+                                        if (selectedProductIds.size === displayProducts.length) {
                                             clearSelection();
                                         } else {
                                             selectAllProducts();
@@ -3324,7 +3539,7 @@ const MarketplaceManagementSystem = () => {
                                     <p className="mt-2 text-gray-500">Загрузка товаров...</p>
                                 </td>
                             </tr>
-                        ) : products.length === 0 ? (
+                        ) : displayProducts.length === 0 ? (
                             <tr>
                                 <td colSpan="8" className="px-6 py-12 text-center">
                                     <div className="text-gray-500">
@@ -3348,7 +3563,7 @@ const MarketplaceManagementSystem = () => {
                                 </td>
                             </tr>
                         ) : (
-                            products.map((product) => (
+                            displayProducts.map((product) => (
                                 <tr key={`${product.id}-${product.nmID}`} className="hover:bg-gray-50">
                                     <td className="px-4 py-4 w-12">
                                         <input
@@ -3484,7 +3699,7 @@ const MarketplaceManagementSystem = () => {
                 </div>
 
                 {/* Пагинация с информацией о размере страницы */}
-                {products.length > 0 && hasMoreProducts && (
+                {displayProducts.length > 0 && hasMoreProducts && (
                     <div className="p-6 border-t border-gray-200 text-center">
                         <button
                             onClick={loadMoreProducts}
@@ -3505,7 +3720,7 @@ const MarketplaceManagementSystem = () => {
                         </button>
                         <div className="mt-3 space-y-1">
                             <p className="text-sm text-gray-600">
-                                Загружено: <strong>{products.length}</strong> товаров
+                                Загружено: <strong>{displayProducts.length}</strong> товаров
                                 {totalProducts > 0 && ` из ${totalProducts.toLocaleString()}`}
                             </p>
                             <p className="text-xs text-gray-500">
@@ -3517,13 +3732,13 @@ const MarketplaceManagementSystem = () => {
                 )}
 
                 {/* Информация о завершении загрузки */}
-                {products.length > 0 && !hasMoreProducts && (
+                {displayProducts.length > 0 && !hasMoreProducts && (
                     <div className="p-4 border-t border-gray-200 text-center">
                         <div className="flex items-center justify-center gap-2 text-gray-500">
                             <CheckCircle size={18} className="text-green-500" />
                             <span>
                             Все товары загружены
-                            ({products.length.toLocaleString()} {totalProducts > 0 ? `из ${totalProducts.toLocaleString()}` : ''} шт.)
+                            ({displayProducts.length.toLocaleString()} {totalProducts > 0 ? `из ${totalProducts.toLocaleString()}` : ''} шт.)
                         </span>
                         </div>
                         <p className="text-xs text-gray-400 mt-1">
@@ -3533,13 +3748,13 @@ const MarketplaceManagementSystem = () => {
                 )}
 
                 {/* Информация для результатов поиска с фильтрами */}
-                {products.length > 0 && (searchQuery || (typeof searchFilters !== 'undefined' && Object.values(searchFilters).some(v => v !== searchFilters.textSearch && v !== '' && v !== -1 && v !== false && v !== 'updatedAt' && v !== 'desc'))) && (
+                {displayProducts.length > 0 && (searchQuery || (typeof searchFilters !== 'undefined' && Object.values(searchFilters).some(v => v !== searchFilters.textSearch && v !== '' && v !== -1 && v !== false && v !== 'updatedAt' && v !== 'desc'))) && (
                     <div className="p-4 border-t border-gray-200 text-center">
                         <div className="flex items-center justify-center gap-2 text-blue-600">
                             <Search size={18} />
                             <span>
-                            Результаты поиска/фильтрации: {products.length} товаров
-                                {totalProducts > products.length && ` из ${totalProducts}`}
+                            Результаты поиска/фильтрации: {displayProducts.length} товаров
+                                {totalProducts > displayProducts.length && ` из ${totalProducts}`}
                         </span>
                         </div>
                         {hasMoreProducts && (
@@ -3569,7 +3784,7 @@ const MarketplaceManagementSystem = () => {
             {renderProductModal()}
             {renderBulkEditModal()}
         </div>
-    );
+    )};
 
     const renderOrders = () => (
         <div className="space-y-6">
@@ -4105,6 +4320,12 @@ const MarketplaceManagementSystem = () => {
             </div>
         </div>
     );
+
+    const displayProducts = filteredProducts.length > 0 ||
+    (searchFilters.brand !== 'all' || searchFilters.category !== 'all' ||
+        searchFilters.showOnlyWithStock || searchFilters.showOnlyActive ||
+        searchFilters.withPhoto !== -1)
+        ? filteredProducts : products;
 
     const renderProfile = () => (
         <div className="space-y-6">
