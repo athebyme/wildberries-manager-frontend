@@ -63,6 +63,12 @@ const MarketplaceManagementSystem = () => {
     const [filteredProducts, setFilteredProducts] = useState([]); // Отфильтрованные товары для отображения
     const [allProducts, setAllProducts] = useState([]); // Все загруженные товары
 
+
+    // Состояния для пагинации отображения (клиентская пагинация)
+    const [displayPageSize, setDisplayPageSize] = useState(100); // Сколько товаров показывать на странице
+    const [currentDisplayPage, setCurrentDisplayPage] = useState(1);
+    const [showDisplayPagination, setShowDisplayPagination] = useState(false);
+
     const logApiError = (error, marketplace) => {
         const errorEntry = {
             id: Date.now(),
@@ -1057,26 +1063,6 @@ const MarketplaceManagementSystem = () => {
         setCategoryCharacteristics([]);
     };
 
-    // Начать редактирование товара
-    const startEditProduct = () => {
-        if (productDetails) {
-            // Создаем глубокую копию и преобразуем характеристики в правильный формат
-            const editableProduct = JSON.parse(JSON.stringify(productDetails));
-
-            // Убеждаемся, что все характеристики имеют значения в виде массивов
-            if (editableProduct.characteristics) {
-                editableProduct.characteristics = editableProduct.characteristics.map(char => ({
-                    ...char,
-                    value: Array.isArray(char.value) ? char.value : (char.value ? [char.value] : []),
-                    popular: char.popular || false
-                }));
-            }
-
-            setEditedProduct(editableProduct);
-            setIsEditMode(true);
-        }
-    };
-
     // Отменить редактирование
     const cancelEditProduct = () => {
         setIsEditMode(false);
@@ -1110,7 +1096,7 @@ const MarketplaceManagementSystem = () => {
         }));
     };
 
-    const fetchWBProductsWithPagination = async (cursor = null, searchText = '', isLoadMore = false, customFilters = null) => {
+    const fetchWBProductsWithPagination = async (cursor = null, searchText = '', isLoadMore = false, customFilters = null, explicitPageSize = null) => {
         try {
             // Используем переданные фильтры или дефолтные значения
             const activeFilters = customFilters || (typeof searchFilters !== 'undefined' ? searchFilters : {
@@ -1134,18 +1120,27 @@ const MarketplaceManagementSystem = () => {
             }
 
             // Определяем желаемый размер страницы
-            const desiredPageSize = customPageSize || pageSize || 50;
+            const currentPageSize = explicitPageSize !== null
+                ? explicitPageSize
+                : getEffectivePageSize();
+
+            console.log(`fetchWBProductsWithPagination: используем размер страницы ${currentPageSize === 'all' ? 'ВСЕ ТОВАРЫ' : currentPageSize}`);
+
+            // Если режим "Все товары"
+            if (currentPageSize === 'all') {
+                return await fetchAllWBProducts(filter, searchText);
+            }
 
             // WB API лимит: максимум 100 карточек за запрос
             const maxCardsPerRequest = 100;
 
             // Рассчитываем сколько запросов нужно сделать
-            const requestsNeeded = Math.ceil(Math.min(desiredPageSize, 1000) / maxCardsPerRequest);
+            const requestsNeeded = Math.ceil(Math.min(currentPageSize, 10000) / maxCardsPerRequest);
 
-            console.log(`Планируется ${requestsNeeded} запросов для получения ${desiredPageSize} товаров (макс. ${maxCardsPerRequest} за запрос)`);
+            console.log(`Планируется ${requestsNeeded} запросов для получения ${currentPageSize} товаров (макс. ${maxCardsPerRequest} за запрос)`);
 
             // Показываем прогресс для больших запросов
-            if (desiredPageSize > 100) {
+            if (currentPageSize > 100) {
                 setLoadingProgress({ current: 0, total: requestsNeeded });
             }
 
@@ -1156,11 +1151,12 @@ const MarketplaceManagementSystem = () => {
             // Делаем серию запросов для получения нужного количества товаров
             for (let requestIndex = 0; requestIndex < requestsNeeded; requestIndex++) {
                 // Обновляем прогресс
-                if (desiredPageSize > 100) {
+                if (currentPageSize > 100) {
                     setLoadingProgress({ current: requestIndex + 1, total: requestsNeeded });
                 }
+
                 // Определяем лимит для текущего запроса
-                const remainingCards = desiredPageSize - allCards.length;
+                const remainingCards = currentPageSize - allCards.length;
                 const currentLimit = Math.min(maxCardsPerRequest, remainingCards);
 
                 if (currentLimit <= 0) break;
@@ -1197,12 +1193,14 @@ const MarketplaceManagementSystem = () => {
                 // Сохраняем последний cursor для следующего запроса
                 finalCursor = cardsResponse.cursor;
 
-                // Обновляем cursor для следующего запроса
+                // Обновляем cursor для следующего запроса согласно документации API
                 if (cardsResponse.cursor && cardsResponse.cards.length === currentLimit) {
+                    // Берем updatedAt и nmID из последней карточки для продолжения пагинации
+                    const lastCard = cardsResponse.cards[cardsResponse.cards.length - 1];
                     currentCursor = {
                         limit: maxCardsPerRequest,
-                        updatedAt: cardsResponse.cursor.updatedAt,
-                        nmID: cardsResponse.cursor.nmID
+                        updatedAt: cardsResponse.cursor.updatedAt || lastCard.updatedAt,
+                        nmID: cardsResponse.cursor.nmID || lastCard.nmID
                     };
                 } else {
                     // Если получили меньше карточек чем запрашивали - больше нет данных
@@ -1213,7 +1211,7 @@ const MarketplaceManagementSystem = () => {
                 // Задержка между запросами для соблюдения лимитов API (100 req/min)
                 if (requestIndex < requestsNeeded - 1) {
                     // Увеличиваем задержку для больших запросов
-                    const delayMs = desiredPageSize > 500 ? 1000 : 700;
+                    const delayMs = currentPageSize > 500 ? 1000 : 700;
                     await delay(delayMs);
                 }
             }
@@ -1356,14 +1354,13 @@ const MarketplaceManagementSystem = () => {
                     photo: photoUrl,
                     needKiz: card.needKiz || false,
                     hasPhoto: !!(card.photos && card.photos.length > 0),
-                    // ДОБАВЬТЕ ЭТО:
                     sizes: card.sizes?.map(s => ({
                         chrtID: s.chrtID,
                         techSize: s.techSize,
                         wbSize: s.wbSize,
                         skus: s.skus,
-                        price: s.price // Важно сохранить цену размера, если она есть
-                    })) || [] // Сохраняем все размеры в нужном формате
+                        price: s.price
+                    })) || []
                 };
             });
 
@@ -1401,6 +1398,261 @@ const MarketplaceManagementSystem = () => {
         }
     };
 
+    // Функция для загрузки ВСЕХ товаров с полной пагинацией
+    const fetchAllWBProducts = async (filter, searchText = '') => {
+        const allCards = [];
+        let currentCursor = { limit: 100 }; // Начинаем с лимита 100
+        let totalProcessedRequests = 0;
+        let hasMoreData = true;
+
+        console.log('🔄 Начинаем полную загрузку всех товаров с пагинацией');
+
+        // Устанавливаем начальный прогресс
+        setLoadingProgress({ current: 0, total: 1 });
+
+        while (hasMoreData) {
+            try {
+                const requestBody = {
+                    settings: {
+                        cursor: currentCursor,
+                        filter
+                    }
+                };
+
+                console.log(`📦 Запрос ${totalProcessedRequests + 1} для получения карточек:`, JSON.stringify(requestBody, null, 2));
+
+                const cardsResponse = await makeWBRequest(`${WB_API_BASE.content}/content/v2/get/cards/list`, {
+                    method: 'POST',
+                    body: JSON.stringify(requestBody)
+                });
+
+                if (!cardsResponse?.cards || cardsResponse.cards.length === 0) {
+                    console.log(`✅ Запрос ${totalProcessedRequests + 1}: карточки не найдены, завершаем полную загрузку`);
+                    break;
+                }
+
+                // Добавляем полученные карточки
+                allCards.push(...cardsResponse.cards);
+                totalProcessedRequests++;
+
+                console.log(`📊 Запрос ${totalProcessedRequests}: получено ${cardsResponse.cards.length} карточек. Всего загружено: ${allCards.length}`);
+
+                // Обновляем прогресс
+                const estimatedTotal = Math.max(totalProcessedRequests + 5, Math.ceil(allCards.length / 100) + 3);
+                setLoadingProgress({
+                    current: totalProcessedRequests,
+                    total: estimatedTotal
+                });
+
+                // Проверяем условие окончания пагинации согласно документации API:
+                // "пока поле total в ответе не станет меньше чем параметр limit в запросе"
+                if (cardsResponse.cards.length < currentCursor.limit) {
+                    console.log(`✅ Получено ${cardsResponse.cards.length} карточек из ${currentCursor.limit} запрошенных. Пагинация завершена.`);
+                    hasMoreData = false;
+                    break;
+                }
+
+                // Если есть cursor, продолжаем пагинацию
+                if (cardsResponse.cursor) {
+                    // Согласно документации API копируем updatedAt и nmID из cursor
+                    const lastCard = cardsResponse.cards[cardsResponse.cards.length - 1];
+                    currentCursor = {
+                        limit: 100,
+                        updatedAt: cardsResponse.cursor.updatedAt || lastCard.updatedAt,
+                        nmID: cardsResponse.cursor.nmID || lastCard.nmID
+                    };
+
+                    console.log(`🔄 Продолжаем пагинацию с cursor:`, currentCursor);
+                } else {
+                    console.log(`✅ Cursor отсутствует, завершаем пагинацию`);
+                    hasMoreData = false;
+                    break;
+                }
+
+                // Задержка между запросами для соблюдения лимитов (100 req/min)
+                await delay(700);
+
+                // Защита от бесконечного цикла (максимум 1000 запросов = до 100,000 товаров)
+                if (totalProcessedRequests >= 1000) {
+                    console.warn(`⚠️ Достигнут лимит безопасности: ${totalProcessedRequests} запросов. Завершаем загрузку.`);
+                    break;
+                }
+
+            } catch (error) {
+                console.error(`❌ Ошибка в запросе ${totalProcessedRequests + 1}:`, error);
+                logApiError(error, 'Wildberries (полная загрузка)');
+
+                // При ошибке ждем больше и пробуем продолжить
+                await delay(2000);
+
+                // Если слишком много ошибок подряд, прерываем
+                if (error.message.includes('429')) {
+                    console.warn('⚠️ Превышен лимит запросов, увеличиваем задержку');
+                    await delay(5000);
+                } else {
+                    // При других ошибках прерываем загрузку
+                    break;
+                }
+            }
+        }
+
+        console.log(`🎉 Полная загрузка завершена! Получено ${allCards.length} карточек за ${totalProcessedRequests} запросов`);
+
+        // Сбрасываем прогресс
+        setLoadingProgress({ current: 0, total: 0 });
+
+        if (allCards.length === 0) {
+            return {
+                products: [],
+                cursor: null,
+                hasMore: false,
+                total: 0
+            };
+        }
+
+        // Получаем дополнительные данные (склады, остатки, цены) как в обычной функции
+        await delay(500);
+
+        // Получаем склады
+        let warehousesResponse = [];
+        if (!window.wbWarehousesCache || Date.now() - (window.wbWarehousesCacheTime || 0) > 300000) {
+            try {
+                warehousesResponse = await makeWBRequest(`${WB_API_BASE.marketplace}/api/v3/warehouses`);
+                window.wbWarehousesCache = warehousesResponse;
+                window.wbWarehousesCacheTime = Date.now();
+            } catch (warehouseError) {
+                console.warn('Ошибка получения складов:', warehouseError);
+                warehousesResponse = window.wbWarehousesCache || [];
+            }
+        } else {
+            warehousesResponse = window.wbWarehousesCache;
+        }
+
+        // Собираем SKU и nmID для массовых запросов
+        const allSkus = [];
+        const allNmIds = [];
+        const skuToCardMap = new Map();
+
+        allCards.forEach(card => {
+            allNmIds.push(card.nmID);
+            if (card.sizes && card.sizes.length > 0) {
+                const cardSkus = card.sizes
+                    .flatMap(size => size.skus || [])
+                    .filter(sku => sku && sku.trim().length > 0);
+                cardSkus.forEach(sku => {
+                    allSkus.push(sku);
+                    skuToCardMap.set(sku, card.nmID);
+                });
+            }
+        });
+
+        console.log(`📋 Подготовка дополнительных данных: ${allSkus.length} SKU, ${allNmIds.length} nmID`);
+
+        // Получение остатков
+        const stocksMap = new Map();
+        if (warehousesResponse.length > 0 && allSkus.length > 0) {
+            const warehouse = warehousesResponse[0];
+
+            // Разбиваем на батчи по 1000 SKU
+            const skuBatches = [];
+            for (let i = 0; i < allSkus.length; i += 1000) {
+                skuBatches.push(allSkus.slice(i, i + 1000));
+            }
+
+            for (const [batchIndex, skuBatch] of skuBatches.entries()) {
+                try {
+                    const stocksResponse = await makeWBRequest(`${WB_API_BASE.marketplace}/api/v3/stocks/${warehouse.id}`, {
+                        method: 'POST',
+                        body: JSON.stringify({ skus: skuBatch })
+                    });
+
+                    if (stocksResponse?.stocks) {
+                        stocksResponse.stocks.forEach(stock => {
+                            const cardId = skuToCardMap.get(stock.sku);
+                            if (cardId) {
+                                const currentStock = stocksMap.get(cardId) || 0;
+                                stocksMap.set(cardId, currentStock + (stock.amount || 0));
+                            }
+                        });
+                    }
+
+                    if (batchIndex < skuBatches.length - 1) {
+                        await delay(250);
+                    }
+                } catch (stockError) {
+                    console.warn(`Ошибка получения остатков для батча ${batchIndex + 1}:`, stockError);
+                }
+            }
+        }
+
+        // Получение цен
+        await delay(300);
+        let pricesMap = {};
+        try {
+            // Разбиваем на батчи для получения цен (если товаров очень много)
+            const nmIdBatches = [];
+            for (let i = 0; i < allNmIds.length; i += 1000) {
+                nmIdBatches.push(allNmIds.slice(i, i + 1000));
+            }
+
+            for (const nmIdBatch of nmIdBatches) {
+                const batchPrices = await fetchWBPrices(nmIdBatch);
+                pricesMap = { ...pricesMap, ...batchPrices };
+                await delay(500); // Задержка между батчами цен
+            }
+        } catch (priceError) {
+            console.warn('Ошибка получения цен для полной загрузки:', priceError);
+        }
+
+        // Формируем результат
+        const processedProducts = allCards.map(card => {
+            const totalStock = stocksMap.get(card.nmID) || 0;
+            const priceInfo = pricesMap[card.nmID] || {};
+            const basePrice = card.sizes?.[0]?.price || 0;
+            const firstPhoto = card.photos?.[0];
+            const photoUrl = firstPhoto ? (
+                typeof firstPhoto === 'string' ? firstPhoto :
+                    firstPhoto.big || firstPhoto.c516x688 || firstPhoto.tm || firstPhoto.square
+            ) : null;
+
+            return {
+                id: card.nmID,
+                name: card.title || card.subjectName || 'Товар без названия',
+                sku: card.vendorCode || `WB-${card.nmID}`,
+                price: priceInfo.price || basePrice,
+                discountedPrice: priceInfo.discountedPrice || priceInfo.price || basePrice,
+                discount: priceInfo.discount || 0,
+                stock: totalStock,
+                marketplace: 'Wildberries',
+                status: totalStock > 0 ? 'active' : (totalStock === 0 ? 'out_of_stock' : 'unknown'),
+                barcode: card.sizes?.[0]?.skus?.[0] || '',
+                brand: card.brand || 'Не указан',
+                category: card.subjectName || 'Не указана',
+                nmID: card.nmID,
+                imtID: card.imtID,
+                createdAt: card.createdAt,
+                updatedAt: card.updatedAt,
+                photo: photoUrl,
+                needKiz: card.needKiz || false,
+                hasPhoto: !!(card.photos && card.photos.length > 0),
+                sizes: card.sizes?.map(s => ({
+                    chrtID: s.chrtID,
+                    techSize: s.techSize,
+                    wbSize: s.wbSize,
+                    skus: s.skus,
+                    price: s.price
+                })) || []
+            };
+        });
+
+        return {
+            products: processedProducts,
+            cursor: null, // При полной загрузке cursor не нужен
+            hasMore: false, // Все данные загружены
+            total: processedProducts.length
+        };
+    };
+
     // Поиск товаров с расширенными фильтрами
     const searchProducts = async (query = '', customFilters = null) => {
         if (!apiKeys.wildberries) {
@@ -1413,6 +1665,7 @@ const MarketplaceManagementSystem = () => {
         setFilteredProducts([]);
         setProductsCursor(null);
         setHasMoreProducts(true);
+        setCurrentDisplayPage(1); // Сбрасываем на первую страницу при новом поиске
 
         try {
             // Обновляем фильтры поиска
@@ -1424,15 +1677,25 @@ const MarketplaceManagementSystem = () => {
 
             setSearchFilters(updatedFilters);
 
-            // Передаем текущий pageSize в функцию загрузки
-            const result = await fetchWBProductsWithPagination(null, query, false, updatedFilters, pageSize);
+            // Определяем правильный размер страницы
+            const currentPageSize = getEffectivePageSize();
+
+            console.log(`Поиск с размером страницы: ${currentPageSize === 'all' ? 'ВСЕ ТОВАРЫ' : currentPageSize}`);
+
+            // Передаем правильный размер страницы в функцию загрузки
+            const result = await fetchWBProductsWithPagination(null, query, false, updatedFilters, currentPageSize);
             setProducts(result.products);
-            setFilteredProducts(result.products);
             setFilteredProducts(result.products);
             setProductsCursor(result.cursor);
             setHasMoreProducts(result.hasMore);
             setTotalProducts(result.total);
             setLastSync(new Date().toLocaleString('ru-RU'));
+
+            // Автоматически включаем пагинацию отображения для больших результатов
+            if (result.products.length > 200 && !showDisplayPagination) {
+                setShowDisplayPagination(true);
+                setCurrentDisplayPage(1);
+            }
 
             console.log(`Поиск завершен: найдено ${result.products.length} товаров из ${result.total}`);
 
@@ -1448,8 +1711,56 @@ const MarketplaceManagementSystem = () => {
         }
     };
 
-// Применение фильтров
+    const getEffectivePageSize = () => {
+        // Если режим "Все товары"
+        if (pageSize === 'all') {
+            return 'all';
+        }
+
+        // Если включен кастомный размер и введено значение
+        if (showCustomPageSize && customPageSize && !isNaN(parseInt(customPageSize))) {
+            const customSize = parseInt(customPageSize);
+            if (customSize > 0 && customSize <= 50000) {
+                return customSize;
+            }
+        }
+
+        // Иначе используем обычный pageSize
+        return pageSize || 50;
+    };
+    // Функция для получения товаров для текущей страницы отображения
+    const getCurrentPageProducts = () => {
+        const sourceProducts = filteredProducts.length > 0 ? filteredProducts : products;
+
+        // Автоматически включаем пагинацию отображения для больших списков
+        if (sourceProducts.length > 200 && !showDisplayPagination) {
+            setShowDisplayPagination(true);
+        }
+
+        if (!showDisplayPagination) {
+            return sourceProducts;
+        }
+
+        const startIndex = (currentDisplayPage - 1) * displayPageSize;
+        const endIndex = startIndex + displayPageSize;
+        return sourceProducts.slice(startIndex, endIndex);
+    };
+    // Расчет общего количества страниц отображения
+    const getTotalDisplayPages = () => {
+        const sourceProducts = filteredProducts.length > 0 ? filteredProducts : products;
+        return Math.ceil(sourceProducts.length / displayPageSize);
+    };
+    // Переход на страницу отображения
+    const goToDisplayPage = (page) => {
+        setCurrentDisplayPage(page);
+        // Прокручиваем к началу таблицы
+        document.querySelector('.products-table')?.scrollIntoView({ behavior: 'smooth' });
+    };
+
+    // Применение фильтров
     const applyFilters = async () => {
+        setCurrentDisplayPage(1); // Сбрасываем на первую страницу при применении фильтров
+
         // Если товары уже загружены, фильтруем локально
         if (products.length > 0 && !searchQuery) {
             let filteredProducts = [...products];
@@ -1523,6 +1834,7 @@ const MarketplaceManagementSystem = () => {
     };
 
     // Сброс фильтров
+    // Сброс фильтров
     const resetFilters = () => {
         const defaultFilters = {
             withPhoto: -1,
@@ -1537,6 +1849,7 @@ const MarketplaceManagementSystem = () => {
         setSearchFilters(defaultFilters);
         setSearchQuery('');
         setFilteredProducts(products); // Сбрасываем фильтрацию
+        setCurrentDisplayPage(1); // Возвращаемся на первую страницу
     };
 
     // Обработка ошибок WB API
@@ -1558,56 +1871,52 @@ const MarketplaceManagementSystem = () => {
 
     const fetchWBOrders = async () => {
         try {
-            // Получаем все заказы без фильтров
-            const params = new URLSearchParams({
-                limit: '1000', // WB ожидает строки для query параметров
-                next: '0',
-                dateFrom: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0], // Последние 30 дней
-                dateTo: new Date().toISOString().split('T')[0]
-            });
+            // Правильный формат для API v3 заказов
+            const dateFrom = new Date();
+            dateFrom.setDate(dateFrom.getDate() - 30);
+            const dateTo = new Date();
 
-            // Формируем URL с query параметрами
-            const url = `${WB_API_BASE.marketplace}/api/v3/orders?${params.toString()}`;
+            // Форматируем даты в правильном формате YYYY-MM-DD
+            const dateFromStr = dateFrom.toISOString().split('T')[0];
+            const dateToStr = dateTo.toISOString().split('T')[0];
 
-            console.log('Запрос заказов WB (GET):', url); // Логируем URL
+            // Исправленный URL без лишних параметров
+            const url = `${WB_API_BASE.marketplace}/api/v3/orders?dateFrom=${dateFromStr}&dateTo=${dateToStr}&limit=1000`;
 
             const ordersResponse = await makeWBRequest(url, {
-                method: 'GET', // ИЗМЕНЕНО НА GET
-                // body: JSON.stringify(...) // Убираем body для GET запроса
+                method: 'GET' // Только GET, без body
             });
 
-            if (!ordersResponse || !ordersResponse.orders || ordersResponse.orders.length === 0) {
-                console.log('Заказов не найдено');
-                return [];
+            // Улучшенная обработка разных форматов ответа
+            let ordersArray = [];
+            if (Array.isArray(ordersResponse)) {
+                ordersArray = ordersResponse;
+            } else if (ordersResponse?.orders) {
+                ordersArray = ordersResponse.orders;
+            } else if (ordersResponse?.result) {
+                ordersArray = ordersResponse.result;
             }
 
-            const orders = ordersResponse.orders.map(order => ({
-                id: order.id,
-                date: new Date(order.createdAt).toLocaleDateString('ru-RU'),
-                customer: order.user?.fio || order.user?.phone || `Заказ ${order.id}`,
-                total: order.convertedPrice || order.price || 0,
-                status: getOrderStatus(order.status || order.wbStatus),
-                marketplace: 'Wildberries',
-                items: order.skus?.length || 1,
-                deliveryDate: order.deliveryDate ?
-                    new Date(order.deliveryDate).toLocaleDateString('ru-RU') :
-                    'Не указано',
-                phone: order.user?.phone || '',
-                article: order.article || order.supplierArticle || '',
-                barcode: order.skus?.[0] || ''
+            // Более гибкая обработка полей заказов
+            return ordersArray.map(order => ({
+                id: order.id || order.orderId || order.orderNumber,
+                date: order.createdAt ? new Date(order.createdAt).toLocaleDateString('ru-RU') :
+                    order.dateCreated ? new Date(order.dateCreated).toLocaleDateString('ru-RU') :
+                        new Date().toLocaleDateString('ru-RU'),
+                customer: order.user?.fio || order.user?.phone || order.userInfo?.name || `Заказ ${order.id}`,
+                total: order.convertedPrice || order.price || order.totalPrice || 0,
+                status: getOrderStatus(order.status || order.wbStatus || order.orderStatus),
+                // ... остальные поля
             }));
 
-            return orders;
         } catch (error) {
-            console.error('Ошибка загрузки заказов WB:', error);
-
-            // Если нет новых заказов или доступа - не показываем как ошибку
-            if (error.message.includes('404') || error.message.includes('не найдено') ||
-                error.message.includes('IncorrectParameter')) {
+            // Улучшенная обработка ошибок
+            if (error.message.includes('IncorrectParameter') ||
+                error.message.includes('404') ||
+                error.message.includes('EmptyResponse')) {
                 console.log('Новых заказов не найдено или неверный формат запроса');
-                return [];
+                return []; // Возвращаем пустой массив вместо ошибки
             }
-
             throw error;
         }
     };
@@ -1796,11 +2105,22 @@ const MarketplaceManagementSystem = () => {
                     try {
                         // Сбрасываем состояние при первой загрузке
                         if (!products.length) {
-                            const result = await fetchWBProductsWithPagination(null, '', false, null, pageSize);
+                            // Используем правильный размер страницы
+                            const currentPageSize = getEffectivePageSize();
+
+                            console.log(`Загрузка товаров с размером страницы: ${currentPageSize === 'all' ? 'ВСЕ ТОВАРЫ' : currentPageSize}`);
+
+                            const result = await fetchWBProductsWithPagination(null, '', false, null, currentPageSize);
                             products = [...products, ...result.products];
                             setProductsCursor(result.cursor);
                             setHasMoreProducts(result.hasMore);
                             setTotalProducts(result.cursor?.total || result.products.length);
+
+                            // Автоматически включаем пагинацию отображения для больших каталогов
+                            if (result.products.length > 200 && !showDisplayPagination) {
+                                setShowDisplayPagination(true);
+                                setCurrentDisplayPage(1);
+                            }
                         }
 
                         const wbOrders = await fetchWBOrders();
@@ -3136,7 +3456,7 @@ const MarketplaceManagementSystem = () => {
                                                     setHasMoreProducts(true);
 
                                                     try {
-                                                        const result = await fetchWBProductsWithPagination(null, query);
+                                                        const result = await fetchWBProductsWithPagination(null, query, false, null, pageSize);
                                                         setProducts(result.products);
                                                         setProductsCursor(result.cursor);
                                                         setHasMoreProducts(result.hasMore);
@@ -3249,24 +3569,24 @@ const MarketplaceManagementSystem = () => {
                                                 onChange={async (e) => {
                                                     if (e.target.value === 'custom') {
                                                         setShowCustomPageSize(true);
+                                                    } else if (e.target.value === 'all') {
+                                                        setPageSize('all');
+                                                        setShowCustomPageSize(false);
+                                                        setCustomPageSize('');
                                                     } else {
                                                         const newSize = parseInt(e.target.value);
                                                         setPageSize(newSize);
                                                         setShowCustomPageSize(false);
                                                         setCustomPageSize('');
-                                                        // НЕ вызываем searchProducts здесь
                                                     }
                                                 }}
                                                 className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white text-gray-900"
                                             >
-                                                <option value={10}>10 товаров</option>
                                                 <option value={30}>30 товаров</option>
-                                                <option value={50}>50 товаров</option>
-                                                <option value={100}>100 товаров</option>
-                                                <option value={200}>200 товаров</option>
-                                                <option value={500}>500 товаров</option>
-                                                <option value={1000}>1000 товаров (макс. рекомендовано)</option>
-                                                <option value="custom">Свой размер...</option>
+                                                <option value={1000}>1000 товаров</option>
+                                                <option value={5000}>5000 товаров</option>
+                                                <option value="all">🔄 Все товары (полная загрузка)</option>
+                                                <option value="custom">✏️ Свой размер...</option>
                                             </select>
 
                                             {showCustomPageSize && (
@@ -3277,25 +3597,60 @@ const MarketplaceManagementSystem = () => {
                                                         onChange={(e) => setCustomPageSize(e.target.value)}
                                                         placeholder="Кол-во"
                                                         min="1"
-                                                        max="10000"
+                                                        max="50000"
                                                         className="w-24 px-3 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                                        onKeyPress={(e) => {
+                                                            if (e.key === 'Enter') {
+                                                                const size = parseInt(customPageSize);
+                                                                if (size > 0 && size <= 50000) {
+                                                                    setPageSize(size);
+                                                                    setShowCustomPageSize(false);
+                                                                    setCustomPageSize('');
+                                                                }
+                                                            }
+                                                        }}
                                                     />
                                                     <button
                                                         onClick={() => {
                                                             const size = parseInt(customPageSize);
-                                                            if (size > 0 && size <= 10000) {
+                                                            if (size > 0 && size <= 50000) {
                                                                 setPageSize(size);
                                                                 setShowCustomPageSize(false);
-                                                                // НЕ вызываем searchProducts здесь
+                                                                setCustomPageSize('');
+                                                            } else {
+                                                                alert('Введите число от 1 до 50000');
                                                             }
                                                         }}
                                                         className="px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                                                        title="Применить кастомный размер"
                                                     >
-                                                        OK
+                                                        ✓
+                                                    </button>
+                                                    <button
+                                                        onClick={() => {
+                                                            setShowCustomPageSize(false);
+                                                            setCustomPageSize('');
+                                                        }}
+                                                        className="px-3 py-2 bg-gray-300 text-gray-700 rounded-lg hover:bg-gray-400"
+                                                        title="Отмена"
+                                                    >
+                                                        ✕
                                                     </button>
                                                 </div>
                                             )}
                                         </div>
+
+                                        {pageSize === 'all' && (
+                                            <div className="mt-2 p-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-700">
+                                                ⚠️ <strong>Режим "Все товары":</strong> Загружаются все карточки с помощью пагинации. Может занять несколько минут для больших каталогов.
+                                            </div>
+                                        )}
+
+                                        {showCustomPageSize && (
+                                            <div className="mt-2 p-2 bg-blue-50 border border-blue-200 rounded text-xs text-blue-700">
+                                                💡 <strong>Совет:</strong> Большие размеры страницы (>1000) могут работать медленно. Для каталогов >10000 товаров используйте "Все товары".
+                                            </div>
+                                        )}
                                     </div>
 
                                     {/* Фильтр по фото */}
@@ -3480,10 +3835,39 @@ const MarketplaceManagementSystem = () => {
                         {/* Информация о текущих настройках */}
                         <div className="text-xs text-gray-500 bg-blue-50 border border-blue-200 rounded-lg p-3">
                             <div className="flex flex-wrap items-center gap-4">
-                                <span><strong>Размер страницы:</strong> {typeof pageSize !== 'undefined' ? pageSize : 50} товаров</span>
+        <span>
+            <strong>Размер страницы:</strong> {
+            (() => {
+                const effectiveSize = getEffectivePageSize();
+                if (effectiveSize === 'all') {
+                    return '🔄 Все товары (полная пагинация)';
+                } else if (showCustomPageSize && customPageSize) {
+                    return `✏️ ${effectiveSize} товаров (кастомный)`;
+                } else {
+                    return `${effectiveSize} товаров`;
+                }
+            })()
+        }
+        </span>
                                 <span><strong>Загружено:</strong> {products.length} товаров</span>
-                                {totalProducts > 0 && <span><strong>Всего доступно:</strong> {totalProducts.toLocaleString()}</span>}
+                                {totalProducts > 0 && (
+                                    <span>
+                <strong>Всего доступно:</strong> {totalProducts.toLocaleString()}
+                                        {getEffectivePageSize() === 'all' && products.length === totalProducts && ' (все загружены ✅)'}
+            </span>
+                                )}
                                 {searchQuery && <span><strong>Поиск:</strong> "{searchQuery}"</span>}
+                                {showDisplayPagination && (
+                                    <span>
+                <strong>Отображение:</strong> стр. {currentDisplayPage} из {getTotalDisplayPages()}
+                                        (по {displayPageSize} товаров)
+            </span>
+                                )}
+                                {getEffectivePageSize() === 'all' && hasMoreProducts && (
+                                    <span className="text-amber-600">
+                <strong>⚠️ Не все товары загружены</strong> - нажмите "Загрузить товары" для полной загрузки
+            </span>
+                                )}
                             </div>
                         </div>
                     </div>
@@ -3699,7 +4083,7 @@ const MarketplaceManagementSystem = () => {
                 </div>
 
                 {/* Пагинация с информацией о размере страницы */}
-                {displayProducts.length > 0 && hasMoreProducts && (
+                {displayProducts.length > 0 && hasMoreProducts && pageSize !== 'all' && (
                     <div className="p-6 border-t border-gray-200 text-center">
                         <button
                             onClick={loadMoreProducts}
@@ -3714,7 +4098,7 @@ const MarketplaceManagementSystem = () => {
                             ) : (
                                 <>
                                     <ChevronDown size={18} />
-                                    Загрузить еще товары ({typeof pageSize !== 'undefined' ? pageSize : 50} шт.)
+                                    Загрузить еще товары ({typeof pageSize !== 'undefined' && pageSize !== 'all' ? pageSize : 50} шт.)
                                 </>
                             )}
                         </button>
@@ -3724,10 +4108,58 @@ const MarketplaceManagementSystem = () => {
                                 {totalProducts > 0 && ` из ${totalProducts.toLocaleString()}`}
                             </p>
                             <p className="text-xs text-gray-500">
-                                Размер страницы: {typeof pageSize !== 'undefined' ? pageSize : 50} товаров •
+                                Размер страницы: {typeof pageSize !== 'undefined' && pageSize !== 'all' ? pageSize : 50} товаров •
                                 {hasMoreProducts ? ` Еще доступно для загрузки` : ' Все товары загружены'}
                             </p>
                         </div>
+                    </div>
+                )}
+
+                {/* Информация о завершении загрузки */}
+                {displayProducts.length > 0 && !hasMoreProducts && pageSize !== 'all' && (
+                    <div className="p-4 border-t border-gray-200 text-center">
+                        <div className="flex items-center justify-center gap-2 text-gray-500">
+                            <CheckCircle size={18} className="text-green-500" />
+                            <span>
+            Все товары загружены
+            ({displayProducts.length.toLocaleString()} {totalProducts > 0 ? `из ${totalProducts.toLocaleString()}` : ''} шт.)
+        </span>
+                        </div>
+                        <p className="text-xs text-gray-400 mt-1">
+                            Размер страницы: {typeof pageSize !== 'undefined' && pageSize !== 'all' ? pageSize : 50} товаров • Используйте фильтры для уточнения результатов
+                        </p>
+                    </div>
+                )}
+
+                {/* Информация для режима "Все товары" */}
+                {pageSize === 'all' && displayProducts.length > 0 && (
+                    <div className="p-4 border-t border-gray-200 text-center">
+                        <div className="flex items-center justify-center gap-2 text-green-600">
+                            <CheckCircle size={18} />
+                            <span>
+                Режим "Все товары": загружено {displayProducts.length.toLocaleString()} товаров
+                                {!hasMoreProducts && ' (полный каталог ✅)'}
+            </span>
+                        </div>
+                        {hasMoreProducts && (
+                            <div className="mt-2">
+                                <p className="text-sm text-amber-600 mb-2">
+                                    ⚠️ Обнаружены дополнительные товары. Нажмите "Загрузить товары" для полной синхронизации.
+                                </p>
+                                <button
+                                    onClick={() => {
+                                        clearProductsData();
+                                        fetchMarketplaceData(selectedMarketplace);
+                                    }}
+                                    className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm"
+                                >
+                                    🔄 Перезагрузить все товары
+                                </button>
+                            </div>
+                        )}
+                        <p className="text-xs text-gray-400 mt-2">
+                            Полная пагинация с автоматической загрузкой всех доступных карточек товаров
+                        </p>
                     </div>
                 )}
 
@@ -4679,62 +5111,231 @@ const MarketplaceManagementSystem = () => {
             </div>
         </div>
     );
-};
+    // Мемоизированный компонент строки товара для оптимизации
+    const ProductRow = React.memo(({ product, selectedProductIds, toggleProductSelection, openProductCard, startEditProduct }) => (
+        <tr key={`${product.id}-${product.nmID}`} className="hover:bg-gray-50">
+            <td className="px-4 py-4 w-12">
+                <input
+                    type="checkbox"
+                    checked={selectedProductIds.has(product.nmID)}
+                    onChange={() => toggleProductSelection(product.nmID)}
+                    className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                />
+            </td>
+            <td className="px-4 py-4 whitespace-nowrap">
+                <div className="flex items-center max-w-xs">
+                    <div className="h-10 w-10 bg-gray-200 rounded-lg mr-3 flex items-center justify-center flex-shrink-0 overflow-hidden">
+                        <LazyProductImage
+                            photo={product.photo}
+                            name={product.name}
+                        />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                        <div className="text-sm font-medium text-gray-900 truncate" title={product.name}>
+                            {product.name}
+                        </div>
+                        <div className="text-xs text-gray-500 truncate">{product.brand}</div>
+                    </div>
+                </div>
+            </td>
+            <td className="px-4 py-4 whitespace-nowrap">
+                <div className="text-sm text-gray-500 font-mono truncate" title={product.sku}>
+                    {product.sku}
+                </div>
+            </td>
+            <td className="px-4 py-4 whitespace-nowrap">
+                <div className="text-sm text-gray-500 font-mono truncate" title={product.barcode}>
+                    {product.barcode}
+                </div>
+            </td>
+            <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">
+                <div className="flex flex-col">
+                    {product.discountedPrice && product.discountedPrice !== product.price ? (
+                        <>
+                            <div className="flex items-center gap-1">
+                            <span className="text-sm font-semibold text-green-600">
+                                ₽{product.discountedPrice.toLocaleString()}
+                            </span>
+                                {product.discount > 0 && (
+                                    <span className="px-1 py-0.5 bg-red-100 text-red-800 text-xs font-medium rounded">
+                                    -{product.discount}%
+                                </span>
+                                )}
+                            </div>
+                            <span className="text-xs text-gray-500 line-through">
+                            ₽{product.price.toLocaleString()}
+                        </span>
+                        </>
+                    ) : (
+                        <span className="text-sm font-medium">
+                        ₽{product.price.toLocaleString()}
+                    </span>
+                    )}
+                </div>
+            </td>
+            <td className="px-4 py-4 whitespace-nowrap">
+            <span className={`text-sm font-medium ${
+                product.stock > 10 ? 'text-green-600' :
+                    product.stock > 0 ? 'text-yellow-600' :
+                        'text-red-600'
+            }`}>
+                {product.stock}
+            </span>
+            </td>
+            <td className="px-4 py-4 whitespace-nowrap">
+                <div className="text-sm text-gray-500 truncate">{product.marketplace}</div>
+            </td>
+            <td className="px-4 py-4 whitespace-nowrap">
+            <span className={`px-2 py-1 inline-flex text-xs leading-5 font-semibold rounded-full ${
+                product.status === 'active'
+                    ? 'bg-green-100 text-green-800'
+                    : product.status === 'out_of_stock'
+                        ? 'bg-red-100 text-red-800'
+                        : 'bg-gray-100 text-gray-800'
+            }`}>
+                {product.status === 'active' ? 'Активен' :
+                    product.status === 'out_of_stock' ? 'Нет в наличии' :
+                        'Неизвестно'}
+            </span>
+            </td>
+            <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-500">
+                <div className="flex gap-1">
+                    <button
+                        className="text-blue-600 hover:text-blue-800 p-1 rounded hover:bg-blue-50"
+                        title="Просмотр"
+                        onClick={() => openProductCard(product)}
+                    >
+                        <Eye size={16}/>
+                    </button>
+                    <button
+                        className="text-gray-600 hover:text-gray-800 p-1 rounded hover:bg-gray-50"
+                        title="Редактировать"
+                        onClick={async () => {
+                            await openProductCard(product);
+                            setTimeout(() => startEditProduct(), 500);
+                        }}
+                    >
+                        <Edit size={16}/>
+                    </button>
+                    <button
+                        className="text-red-600 hover:text-red-800 p-1 rounded hover:bg-red-50"
+                        title="Удалить">
+                        <Trash2 size={16}/>
+                    </button>
+                </div>
+            </td>
+        </tr>
+    ));
 
-const startEditProduct = () => {
-    if (productDetails) {
-        // Создаем глубокую копию и преобразуем характеристики в правильный формат
-        const editableProduct = JSON.parse(JSON.stringify(productDetails));
+    // Компонент для ленивой загрузки изображений
+    const LazyProductImage = React.memo(({ photo, name }) => {
+        const [imageLoaded, setImageLoaded] = useState(false);
+        const [imageError, setImageError] = useState(false);
+        const [isInView, setIsInView] = useState(false);
+        const imgRef = useRef(null);
 
-        // Убеждаемся, что есть хотя бы один размер
-        if (!editableProduct.sizes || editableProduct.sizes.length === 0) {
-            editableProduct.sizes = [{
-                techSize: "0",
-                wbSize: "",
-                skus: editableProduct.barcode ? [editableProduct.barcode] : [],
-                price: editableProduct.price || 0
-            }];
+        useEffect(() => {
+            const observer = new IntersectionObserver(
+                ([entry]) => {
+                    if (entry.isIntersecting) {
+                        setIsInView(true);
+                        observer.disconnect();
+                    }
+                },
+                { threshold: 0.1 }
+            );
+
+            if (imgRef.current) {
+                observer.observe(imgRef.current);
+            }
+
+            return () => observer.disconnect();
+        }, []);
+
+        if (!photo || imageError) {
+            return (
+                <div className="w-full h-full bg-gray-200 flex items-center justify-center">
+                    <Package className="text-gray-400" size={20} />
+                </div>
+            );
         }
 
-        // Убеждаемся, что все размеры имеют techSize
-        editableProduct.sizes = editableProduct.sizes.map(size => ({
-            ...size,
-            techSize: size.techSize || "0",
-            skus: Array.isArray(size.skus) ? size.skus : []
-        }));
+        return (
+            <div ref={imgRef} className="w-full h-full relative">
+                {isInView ? (
+                    <>
+                        <img
+                            src={`${photo}`}
+                            alt={name}
+                            className={`w-full h-full object-cover transition-opacity duration-200 ${
+                                imageLoaded ? 'opacity-100' : 'opacity-0'
+                            }`}
+                            onLoad={() => setImageLoaded(true)}
+                            onError={() => setImageError(true)}
+                        />
+                        {!imageLoaded && (
+                            <div className="absolute inset-0 bg-gray-200 flex items-center justify-center">
+                                <div className="w-4 h-4 border-2 border-gray-400 border-t-transparent rounded-full animate-spin"></div>
+                            </div>
+                        )}
+                    </>
+                ) : (
+                    <div className="w-full h-full bg-gray-200 flex items-center justify-center">
+                        <div className="w-4 h-4 border-2 border-gray-400 border-t-transparent rounded-full animate-spin"></div>
+                    </div>
+                )}
+            </div>
+        );
+    });
 
-        // Убеждаемся, что все характеристики имеют значения в виде массивов
-        if (editableProduct.characteristics) {
-            editableProduct.characteristics = editableProduct.characteristics.map(char => ({
-                ...char,
-                value: Array.isArray(char.value) ? char.value : (char.value ? [char.value] : []),
-                popular: char.popular || false
-            }));
+    // Начать редактирование товара
+    const startEditProduct = () => {
+        if (productDetails) {
+            // Создаем глубокую копию и преобразуем характеристики в правильный формат
+            const editableProduct = JSON.parse(JSON.stringify(productDetails));
+
+            // Убеждаемся, что все характеристики имеют значения в виде массивов
+            if (editableProduct.characteristics) {
+                editableProduct.characteristics = editableProduct.characteristics.map(char => ({
+                    ...char,
+                    value: Array.isArray(char.value) ? char.value : (char.value ? [char.value] : []),
+                    popular: char.popular || false
+                }));
+            }
+
+            setEditedProduct(editableProduct);
+            setIsEditMode(true);
         }
+    };
 
-        setEditedProduct(editableProduct);
-        setIsEditMode(true);
-    }
-};
+    // Добавить кнопку переключения режима отображения
+    const toggleDisplayPagination = () => {
+        setShowDisplayPagination(!showDisplayPagination);
+        setCurrentDisplayPage(1);
+    };
 
-const loadMoreProducts = async () => {
-    if (!hasMoreProducts || isLoadingMore) return;
+    const loadMoreProducts = async () => {
+        if (!hasMoreProducts || isLoadingMore) return;
 
-    setIsLoadingMore(true);
-    try {
-        const result = await fetchWBProductsWithPagination(productsCursor, searchQuery, true, searchFilters, pageSize);
+        setIsLoadingMore(true);
+        try {
+            // Используем правильный размер страницы для догрузки
+            const currentPageSize = getEffectivePageSize();
 
-        if (result.products.length > 0) {
-            setProducts(prevProducts => [...prevProducts, ...result.products]);
-            setProductsCursor(result.cursor);
-            setHasMoreProducts(result.hasMore);
+            const result = await fetchWBProductsWithPagination(productsCursor, searchQuery, true, searchFilters, currentPageSize);
+
+            if (result.products.length > 0) {
+                setProducts(prevProducts => [...prevProducts, ...result.products]);
+                setProductsCursor(result.cursor);
+                setHasMoreProducts(result.hasMore);
+            }
+        } catch (error) {
+            console.error('Ошибка загрузки дополнительных товаров:', error);
+            logApiError(error, 'Wildberries');
+        } finally {
+            setIsLoadingMore(false);
         }
-    } catch (error) {
-        console.error('Ошибка загрузки дополнительных товаров:', error);
-        logApiError(error, 'Wildberries');
-    } finally {
-        setIsLoadingMore(false);
-    }
+    };
 };
 
 export default MarketplaceManagementSystem;
